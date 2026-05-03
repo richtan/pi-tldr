@@ -5,8 +5,16 @@
  * fast-LLM TLDR output, using agent events as facts.
  */
 
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { type Api, complete, type Model, type UserMessage } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
+import {
+	getAgentDir,
+	type ExtensionAPI,
+	type ExtensionContext,
+	ModelSelectorComponent,
+	type Theme,
+} from "@mariozechner/pi-coding-agent";
 import { type Component, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 
 /**
@@ -14,6 +22,10 @@ import { type Component, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi
  * the same UI box instead of creating multiple boxes.
  */
 const WIDGET_KEY = "pi-tldr";
+const TLDR_MODEL_FLAG = "tldr-model";
+const TLDR_MODEL_CONFIG_FILE = "pi-tldr.json";
+const AUTOMATIC_MODEL_CHOICE = "auto";
+const AUTOMATIC_MODEL_PROVIDER = "pi-tldr";
 const TITLE = " tldr ";
 const MIN_BOX_WIDTH = 12;
 const MAX_FACT_CHARS = 1_800;
@@ -22,22 +34,46 @@ const MAX_ACTIVITY_HISTORY = 5;
 const LLM_UPDATE_INTERVAL_MS = 1_200;
 const TLDR_MAX_TOKENS = 80;
 
+type ModelCandidate = { provider: string; id: string };
+type ModelSelectorSettings = ConstructorParameters<typeof ModelSelectorComponent>[2];
+type ModelSelectorRegistry = ConstructorParameters<typeof ModelSelectorComponent>[3];
+
 /**
- * Fast/cheap models in preference order. The first configured model with usable
- * auth is used for TLDR generation.
+ * Confirmed working TLDR models in automatic preference order. Haiku stays first
+ * because TLDR generation should prefer fast, inexpensive models when available.
  */
-const FAST_MODEL_CANDIDATES: ReadonlyArray<{ provider: string; id: string }> = [
-	{ provider: "google", id: "gemini-2.5-flash-lite" },
-	{ provider: "google", id: "gemini-2.5-flash" },
-	{ provider: "google", id: "gemini-2.0-flash-lite" },
-	{ provider: "google", id: "gemini-2.0-flash" },
-	{ provider: "openai", id: "gpt-5.4-mini" },
-	{ provider: "openai", id: "gpt-5-mini" },
-	{ provider: "openai", id: "gpt-4.1-mini" },
-	{ provider: "openai", id: "gpt-4o-mini" },
+const FAST_MODEL_CANDIDATES: ReadonlyArray<ModelCandidate> = [
 	{ provider: "anthropic", id: "claude-haiku-4-5" },
 	{ provider: "anthropic", id: "claude-haiku-4-5-20251001" },
+	{ provider: "anthropic", id: "claude-sonnet-4-5" },
+	{ provider: "anthropic", id: "claude-sonnet-4-5-20250929" },
+	{ provider: "anthropic", id: "claude-sonnet-4-6" },
+	{ provider: "anthropic", id: "claude-opus-4-1" },
+	{ provider: "anthropic", id: "claude-opus-4-1-20250805" },
+	{ provider: "anthropic", id: "claude-opus-4-5" },
+	{ provider: "anthropic", id: "claude-opus-4-5-20251101" },
+	{ provider: "anthropic", id: "claude-opus-4-6" },
+	{ provider: "anthropic", id: "claude-opus-4-7" },
 ];
+
+const AUTOMATIC_TLDR_MODEL: Model<Api> = {
+	id: AUTOMATIC_MODEL_CHOICE,
+	name: "Automatic",
+	api: "pi-tldr-automatic",
+	provider: AUTOMATIC_MODEL_PROVIDER,
+	baseUrl: "",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 0,
+	maxTokens: 0,
+};
+
+const MODEL_SELECTOR_SETTINGS = {
+	setDefaultModelAndProvider() {
+		// pi-tldr stores its own model preference instead of changing pi's default model.
+	},
+} as unknown as ModelSelectorSettings;
 
 /**
  * The only place that shapes visible TLDR wording. The code validates output
@@ -72,6 +108,8 @@ type FastModelAuth = {
  */
 type RuntimeState = {
 	active: boolean;
+	/** User-selected model tried before the default candidate list. */
+	preferredModel: ModelCandidate | undefined;
 	/** Lets async LLM calls detect that the session/request changed before rendering. */
 	generation: number;
 	/** Invalidates older LLM calls within the same request when newer facts arrive. */
@@ -150,6 +188,7 @@ class PiTldrBox implements Component {
 function createInitialState(): RuntimeState {
 	return {
 		active: false,
+		preferredModel: undefined,
 		generation: 0,
 		refinementGeneration: 0,
 		prompt: "",
@@ -240,6 +279,144 @@ function extractAssistantText(message: { content?: unknown } | undefined): strin
  */
 function compactEventFacts(value: unknown): string {
 	return truncateText(stripAnsi(safeJsonPreview(value)), MAX_FACT_CHARS);
+}
+
+function formatModelSpec(candidate: ModelCandidate): string {
+	return `${candidate.provider}/${candidate.id}`;
+}
+
+function formatRegistryModel(model: Model<Api>): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function parseModelSpec(value: unknown): ModelCandidate | undefined {
+	if (typeof value !== "string") return undefined;
+
+	const trimmed = value.trim();
+	const separator = trimmed.indexOf("/");
+	if (separator <= 0 || separator === trimmed.length - 1) return undefined;
+
+	return {
+		provider: trimmed.slice(0, separator),
+		id: trimmed.slice(separator + 1),
+	};
+}
+
+function isSupportedTldrModel(candidate: ModelCandidate): boolean {
+	return FAST_MODEL_CANDIDATES.some((supported) => formatModelSpec(supported) === formatModelSpec(candidate));
+}
+
+function parseSupportedModelSpec(value: unknown): ModelCandidate | undefined {
+	const candidate = parseModelSpec(value);
+	return candidate && isSupportedTldrModel(candidate) ? candidate : undefined;
+}
+
+function supportedModelList(): string {
+	return FAST_MODEL_CANDIDATES.map(formatModelSpec).join(", ");
+}
+
+function modelCandidates(preferredModel?: ModelCandidate): ReadonlyArray<ModelCandidate> {
+	if (!preferredModel) return FAST_MODEL_CANDIDATES;
+
+	return [
+		preferredModel,
+		...FAST_MODEL_CANDIDATES.filter((candidate) => formatModelSpec(candidate) !== formatModelSpec(preferredModel)),
+	];
+}
+
+function tldrConfigPath(): string {
+	return join(getAgentDir(), TLDR_MODEL_CONFIG_FILE);
+}
+
+/**
+ * Global extension preference stored outside session history. Pi has session
+ * persistence and CLI flags, but no public namespaced global settings writer.
+ */
+function loadPreferredModel(): ModelCandidate | undefined {
+	try {
+		const path = tldrConfigPath();
+		if (!existsSync(path)) return undefined;
+
+		const data = asRecord(JSON.parse(readFileSync(path, "utf8")));
+		return parseSupportedModelSpec(data?.model);
+	} catch {
+		return undefined;
+	}
+}
+
+function savePreferredModel(preferredModel: ModelCandidate): boolean {
+	try {
+		const path = tldrConfigPath();
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, `${JSON.stringify({ model: formatModelSpec(preferredModel) }, null, 2)}\n`);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function clearPreferredModel(): boolean {
+	try {
+		const path = tldrConfigPath();
+		if (existsSync(path)) rmSync(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function isAutomaticModel(model: Model<Api>): boolean {
+	return model.provider === AUTOMATIC_MODEL_PROVIDER && model.id === AUTOMATIC_MODEL_CHOICE;
+}
+
+function createModelSelectorRegistry(ctx: ExtensionContext): ModelSelectorRegistry {
+	return new Proxy(ctx.modelRegistry, {
+		get(target, property, receiver) {
+			if (property === "find") {
+				return (provider: string, id: string) =>
+					provider === AUTOMATIC_MODEL_PROVIDER && id === AUTOMATIC_MODEL_CHOICE
+						? AUTOMATIC_TLDR_MODEL
+						: target.find(provider, id);
+			}
+
+			if (property === "getAvailable") {
+				return () => {
+					const availableBySpec = new Map(target.getAvailable().map((model) => [formatRegistryModel(model), model]));
+					return [
+						AUTOMATIC_TLDR_MODEL,
+						...FAST_MODEL_CANDIDATES.map(formatModelSpec)
+							.map((spec) => availableBySpec.get(spec))
+							.filter((model): model is Model<Api> => model !== undefined),
+					];
+				};
+			}
+
+			const value = Reflect.get(target, property, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as ModelSelectorRegistry;
+}
+
+async function selectTldrModel(ctx: ExtensionContext, state: RuntimeState): Promise<string | undefined> {
+	const selectorRegistry = createModelSelectorRegistry(ctx);
+	const currentModel = state.preferredModel
+		? selectorRegistry.find(state.preferredModel.provider, state.preferredModel.id)
+		: AUTOMATIC_TLDR_MODEL;
+
+	const selectedModel = await ctx.ui.custom<Model<Api> | undefined>((tui, _theme, _keybindings, done) =>
+		new ModelSelectorComponent(
+			tui,
+			currentModel,
+			MODEL_SELECTOR_SETTINGS,
+			selectorRegistry,
+			[],
+			(model) => done(model),
+			() => done(undefined),
+		),
+	);
+
+	if (!selectedModel) return undefined;
+	return isAutomaticModel(selectedModel) ? AUTOMATIC_MODEL_CHOICE : formatRegistryModel(selectedModel);
 }
 
 /**
@@ -334,8 +511,8 @@ function extractSummary(response: string): string | undefined {
 /**
  * Lazily finds the first configured fast model with usable auth.
  */
-async function getFastModelAuth(ctx: ExtensionContext): Promise<FastModelAuth | undefined> {
-	for (const candidate of FAST_MODEL_CANDIDATES) {
+async function getFastModelAuth(ctx: ExtensionContext, preferredModel?: ModelCandidate): Promise<FastModelAuth | undefined> {
+	for (const candidate of modelCandidates(preferredModel)) {
 		const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
 		if (!model) continue;
 
@@ -424,7 +601,7 @@ async function generateSummary(ctx: ExtensionContext, state: RuntimeState, reque
 
 	let auth: FastModelAuth | undefined;
 	try {
-		auth = await getFastModelAuth(ctx);
+		auth = await getFastModelAuth(ctx, state.preferredModel);
 	} catch {
 		return;
 	}
@@ -471,10 +648,61 @@ async function generateSummary(ctx: ExtensionContext, state: RuntimeState, reque
  * Registers pi lifecycle handlers that turn agent events into live TLDR updates.
  */
 export default function piTldr(pi: ExtensionAPI) {
+	pi.registerFlag(TLDR_MODEL_FLAG, {
+		description: "Preferred model for pi-tldr summaries, in provider/model-id format",
+		type: "string",
+	});
+
 	// State is deliberately explicit and local to this installed extension instance.
 	// Read the handlers below as the lifecycle: session setup, request start,
 	// streaming/tool updates, then final assistant completion.
 	const state = createInitialState();
+
+	pi.registerCommand("tldr-model", {
+		description: "Choose the model used for pi-tldr summaries",
+		handler: async (args, ctx) => {
+			let value = args.trim();
+			if (!value) {
+				if (!ctx.hasUI) {
+					ctx.ui.notify("Use /tldr-model provider/model-id, /tldr-model auto, or /tldr-model reset", "error");
+					return;
+				}
+
+				const choice = await selectTldrModel(ctx, state);
+				if (!choice) return;
+				value = choice;
+			}
+
+			if (value === AUTOMATIC_MODEL_CHOICE || value === "reset") {
+				state.preferredModel = undefined;
+				state.lastFacts = "";
+				requestRefinement(ctx, state, "now");
+				ctx.ui.notify(
+					clearPreferredModel()
+						? "pi-tldr model set to auto"
+						: "pi-tldr model set to auto, but the saved preference could not be removed",
+					"info",
+				);
+				return;
+			}
+
+			const nextModel = parseSupportedModelSpec(value);
+			if (!nextModel) {
+				ctx.ui.notify(`Use one of the supported pi-tldr models: ${supportedModelList()}`, "error");
+				return;
+			}
+
+			state.preferredModel = nextModel;
+			state.lastFacts = "";
+			requestRefinement(ctx, state, "now");
+			ctx.ui.notify(
+				savePreferredModel(nextModel)
+					? `pi-tldr model set to ${formatModelSpec(nextModel)}`
+					: `pi-tldr model set to ${formatModelSpec(nextModel)}, but the preference could not be saved`,
+				"info",
+			);
+		},
+	});
 
 	// A new/resumed session can reuse the loaded extension, so clear old UI and
 	// invalidate any async work from a previous session generation.
@@ -482,6 +710,7 @@ export default function piTldr(pi: ExtensionAPI) {
 		state.generation++;
 		state.active = true;
 		state.currentSummary = "";
+		state.preferredModel = parseSupportedModelSpec(pi.getFlag(TLDR_MODEL_FLAG)) ?? loadPreferredModel();
 		clearWidget(ctx);
 	});
 
