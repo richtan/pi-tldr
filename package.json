@@ -1,6 +1,6 @@
 {
   "name": "pi-tldr",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A pi coding-agent extension that shows live TLDR summaries above the input bar.",
   "type": "module",
   "license": "MIT",
