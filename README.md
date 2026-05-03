@@ -37,21 +37,27 @@ pi remove npm:pi-tldr
 
 ## Supported TLDR models
 
-Only these confirmed-working, non-deprecated models are supported for TLDR generation and direct selection:
+Only these confirmed-working models are supported for TLDR generation and direct selection:
 
 1. `anthropic/claude-haiku-4-5`
 2. `anthropic/claude-haiku-4-5-20251001`
-3. `anthropic/claude-sonnet-4-5`
-4. `anthropic/claude-sonnet-4-5-20250929`
-5. `anthropic/claude-sonnet-4-6`
-6. `anthropic/claude-opus-4-1`
-7. `anthropic/claude-opus-4-1-20250805`
-8. `anthropic/claude-opus-4-5`
-9. `anthropic/claude-opus-4-5-20251101`
-10. `anthropic/claude-opus-4-6`
-11. `anthropic/claude-opus-4-7`
+3. `openai-codex/gpt-5.4-mini`
+4. `openai-codex/gpt-5.3-codex-spark`
+5. `openai-codex/gpt-5.2`
+6. `openai-codex/gpt-5.3-codex`
+7. `openai-codex/gpt-5.4`
+8. `openai-codex/gpt-5.5`
+9. `anthropic/claude-sonnet-4-5`
+10. `anthropic/claude-sonnet-4-5-20250929`
+11. `anthropic/claude-sonnet-4-6`
+12. `anthropic/claude-opus-4-1`
+13. `anthropic/claude-opus-4-1-20250805`
+14. `anthropic/claude-opus-4-5`
+15. `anthropic/claude-opus-4-5-20251101`
+16. `anthropic/claude-opus-4-6`
+17. `anthropic/claude-opus-4-7`
 
-`auto` tries the supported models in this order, with Haiku first to prefer fast, inexpensive TLDR generation. If none has a configured API key, the extension stays quiet instead of showing fake fallback text.
+`auto` tries the supported models in this order, with Haiku and small Codex models first to prefer fast TLDR generation. If none has a configured API key, the extension stays quiet instead of showing fake fallback text.
 
 ## Choose a TLDR model
 

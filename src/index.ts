@@ -7,7 +7,7 @@
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { type Api, complete, type Model, type UserMessage } from "@mariozechner/pi-ai";
+import { type Api, complete, type Model, type ProviderStreamOptions, type UserMessage } from "@mariozechner/pi-ai";
 import {
 	getAgentDir,
 	type ExtensionAPI,
@@ -39,12 +39,18 @@ type ModelSelectorSettings = ConstructorParameters<typeof ModelSelectorComponent
 type ModelSelectorRegistry = ConstructorParameters<typeof ModelSelectorComponent>[3];
 
 /**
- * Confirmed working TLDR models in automatic preference order. Haiku stays first
- * because TLDR generation should prefer fast, inexpensive models when available.
+ * Confirmed working TLDR models in automatic preference order. Haiku stays first;
+ * then small/fast Codex models are preferred before larger Sonnet/Opus models.
  */
 const FAST_MODEL_CANDIDATES: ReadonlyArray<ModelCandidate> = [
 	{ provider: "anthropic", id: "claude-haiku-4-5" },
 	{ provider: "anthropic", id: "claude-haiku-4-5-20251001" },
+	{ provider: "openai-codex", id: "gpt-5.4-mini" },
+	{ provider: "openai-codex", id: "gpt-5.3-codex-spark" },
+	{ provider: "openai-codex", id: "gpt-5.2" },
+	{ provider: "openai-codex", id: "gpt-5.3-codex" },
+	{ provider: "openai-codex", id: "gpt-5.4" },
+	{ provider: "openai-codex", id: "gpt-5.5" },
 	{ provider: "anthropic", id: "claude-sonnet-4-5" },
 	{ provider: "anthropic", id: "claude-sonnet-4-5-20250929" },
 	{ provider: "anthropic", id: "claude-sonnet-4-6" },
@@ -522,6 +528,22 @@ async function getFastModelAuth(ctx: ExtensionContext, preferredModel?: ModelCan
 	return undefined;
 }
 
+function createCompletionOptions(auth: FastModelAuth, signal: AbortSignal): ProviderStreamOptions {
+	const options: ProviderStreamOptions = {
+		apiKey: auth.apiKey,
+		headers: auth.headers,
+		maxTokens: TLDR_MAX_TOKENS,
+		maxRetries: 0,
+		signal,
+	};
+
+	// ChatGPT-backed Codex Responses rejects `temperature`; other providers use it
+	// to keep TLDR wording stable without introducing retries or fallbacks.
+	if (auth.model.provider !== "openai-codex") options.temperature = 0.2;
+
+	return options;
+}
+
 /**
  * Cancels pending work at request/session boundaries so stale TLDRs cannot render.
  */
@@ -620,14 +642,7 @@ async function generateSummary(ctx: ExtensionContext, state: RuntimeState, reque
 		const response = await complete(
 			auth.model,
 			{ systemPrompt: TLDR_SYSTEM_PROMPT, messages: [message] },
-			{
-				apiKey: auth.apiKey,
-				headers: auth.headers,
-				maxTokens: TLDR_MAX_TOKENS,
-				maxRetries: 0,
-				temperature: 0.2,
-				signal: abortController.signal,
-			},
+			createCompletionOptions(auth, abortController.signal),
 		);
 		if (!isCurrent(state, request) || response.stopReason !== "stop") return;
 
