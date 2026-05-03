@@ -1,26 +1,46 @@
 /**
  * pi-tldr extension.
  *
- * Shows a compact live summary box above the input editor. It renders only
- * fast-LLM TLDR output, using agent events as facts.
+ * Shows a compact live summary box above the input editor. It renders fast-LLM
+ * TLDR output from typed agent lifecycle facts.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { type Api, complete, type Model, type ProviderStreamOptions, type UserMessage } from "@mariozechner/pi-ai";
 import {
-	getAgentDir,
-	type ExtensionAPI,
-	type ExtensionContext,
-	ModelSelectorComponent,
-	type Theme,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, extname, isAbsolute, join } from "node:path";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import {
+  type Api,
+  type AssistantMessage,
+  complete,
+  type ImageContent,
+  type Model,
+  type ProviderStreamOptions,
+  type TextContent,
+  type UserMessage,
+} from "@mariozechner/pi-ai";
+import {
+  getAgentDir,
+  type ExtensionAPI,
+  type ExtensionContext,
+  isToolCallEventType,
+  ModelSelectorComponent,
+  SettingsManager,
+  type Theme,
+  type ToolCallEvent,
+  type ToolResultEvent,
 } from "@mariozechner/pi-coding-agent";
-import { type Component, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import {
+  type Component,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from "@mariozechner/pi-tui";
 
-/**
- * Widget/display settings. The widget key is stable so later updates replace
- * the same UI box instead of creating multiple boxes.
- */
 const WIDGET_KEY = "pi-tldr";
 const TLDR_MODEL_FLAG = "tldr-model";
 const TLDR_MODEL_CONFIG_FILE = "pi-tldr.json";
@@ -31,861 +51,1142 @@ const MIN_BOX_WIDTH = 12;
 const MAX_FACT_CHARS = 1_800;
 const MAX_PROMPT_CHARS = 220;
 const MAX_ACTIVITY_HISTORY = 5;
+const MAX_SUMMARY_CHARS = 180;
 const LLM_UPDATE_INTERVAL_MS = 1_200;
 const TLDR_MAX_TOKENS = 80;
+const FINAL_RESULT_CONTEXT_CHARS = 1_200;
 
-type ModelCandidate = { provider: string; id: string };
-type ModelSelectorSettings = ConstructorParameters<typeof ModelSelectorComponent>[2];
-type ModelSelectorRegistry = ConstructorParameters<typeof ModelSelectorComponent>[3];
+const SUMMARY_FORMAT_PATTERN =
+  /^['"`]|['"`]$|```|\[[^\]]+]\([^)]*\)|^\s*[-*+]\s+|^\s*#{1,6}\s+|<[^>]+>/;
+const STRUCTURED_TOKEN_PATTERN = /[{}[\]":,]/;
+const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+const PRIVATE_KEY_PATTERN =
+  /-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/g;
+const TOKEN_PATTERN =
+  /\b(?:sk-[A-Za-z0-9_-]{20,}|(?:ghp|gho|github_pat|xox[baprs])_[A-Za-z0-9_-]+|xox[baprs]-[A-Za-z0-9-]+)\b/g;
+const SECRET_ASSIGNMENT_PATTERN =
+  /\b(password|passwd|pwd|secret|token|api[_-]?key)\s*[=:]\s*\S+/gi;
 
-/**
- * Confirmed working TLDR models in automatic preference order. Haiku stays first;
- * then small/fast Codex models are preferred before larger Sonnet/Opus models.
- */
-const FAST_MODEL_CANDIDATES: ReadonlyArray<ModelCandidate> = [
-	{ provider: "anthropic", id: "claude-haiku-4-5" },
-	{ provider: "anthropic", id: "claude-haiku-4-5-20251001" },
-	{ provider: "openai-codex", id: "gpt-5.4-mini" },
-	{ provider: "openai-codex", id: "gpt-5.3-codex-spark" },
-	{ provider: "openai-codex", id: "gpt-5.2" },
-	{ provider: "openai-codex", id: "gpt-5.3-codex" },
-	{ provider: "openai-codex", id: "gpt-5.4" },
-	{ provider: "openai-codex", id: "gpt-5.5" },
-	{ provider: "anthropic", id: "claude-sonnet-4-5" },
-	{ provider: "anthropic", id: "claude-sonnet-4-5-20250929" },
-	{ provider: "anthropic", id: "claude-sonnet-4-6" },
-	{ provider: "anthropic", id: "claude-opus-4-1" },
-	{ provider: "anthropic", id: "claude-opus-4-1-20250805" },
-	{ provider: "anthropic", id: "claude-opus-4-5" },
-	{ provider: "anthropic", id: "claude-opus-4-5-20251101" },
-	{ provider: "anthropic", id: "claude-opus-4-6" },
-	{ provider: "anthropic", id: "claude-opus-4-7" },
+interface ModelCandidate {
+  readonly provider: string;
+  readonly id: string;
+}
+
+interface FastModelAuth {
+  readonly model: Model<Api>;
+  readonly apiKey: string;
+  readonly headers?: Record<string, string>;
+}
+
+interface RuntimeState {
+  active: boolean;
+  preferredModel?: ModelCandidate;
+  generation: number;
+  refinementGeneration: number;
+  prompt: string;
+  readonly activity: string[];
+  currentSummary: string;
+  lastFacts: string;
+  lastLlmStart: number;
+  pendingRequest?: RefinementRequest;
+  updateTimer?: ReturnType<typeof setTimeout>;
+  activeRequest?: AbortController;
+  readonly toolIntentById: Map<string, ToolIntent>;
+}
+
+interface RefinementRequest {
+  readonly facts: string;
+  readonly generation: number;
+  readonly refinementGeneration: number;
+}
+
+interface PreferenceOperationResult {
+  readonly ok: boolean;
+  readonly message?: string;
+}
+
+type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonObject
+  | readonly JsonValue[];
+
+interface JsonObject {
+  readonly [key: string]: JsonValue | undefined;
+}
+
+interface BaseFact {
+  readonly kind: FactKind;
+}
+
+interface MessageUpdateFact extends BaseFact {
+  readonly kind: FactKind.MessageUpdate;
+  readonly assistantText: string;
+}
+
+interface ToolStartFact extends BaseFact {
+  readonly kind: FactKind.ToolStart;
+  readonly intent: ToolIntent;
+}
+
+interface ToolEndFact extends BaseFact {
+  readonly kind: FactKind.ToolEnd;
+  readonly toolName: string;
+  readonly isError: boolean;
+  readonly resultText?: string;
+  readonly intent?: ToolIntent;
+}
+
+interface MessageEndFact extends BaseFact {
+  readonly kind: FactKind.MessageEnd;
+  readonly stopReason: CompletedStopReason;
+  readonly errorMessage?: string;
+  readonly finalResultContext?: string;
+}
+
+type TldrFact =
+  | MessageUpdateFact
+  | ToolStartFact
+  | ToolEndFact
+  | MessageEndFact;
+
+type AssistantContent = AssistantMessage["content"][number];
+type TextSourceContent = AssistantContent | TextContent | ImageContent;
+
+type ToolIntent =
+  | BashIntent
+  | ReadIntent
+  | GrepIntent
+  | FindIntent
+  | LsIntent
+  | EditIntent
+  | WriteIntent
+  | CustomIntent;
+
+interface BaseToolIntent {
+  readonly kind: ToolKind;
+  readonly toolCallId: string;
+}
+
+interface BashIntent extends BaseToolIntent {
+  readonly kind: ToolKind.Bash;
+  readonly command: string;
+}
+
+interface ReadIntent extends BaseToolIntent {
+  readonly kind: ToolKind.Read;
+  readonly path: string;
+  readonly offset?: number;
+  readonly limit?: number;
+}
+
+interface GrepIntent extends BaseToolIntent {
+  readonly kind: ToolKind.Grep;
+  readonly pattern: string;
+  readonly path?: string;
+  readonly glob?: string;
+}
+
+interface FindIntent extends BaseToolIntent {
+  readonly kind: ToolKind.Find;
+  readonly pattern: string;
+  readonly path?: string;
+}
+
+interface LsIntent extends BaseToolIntent {
+  readonly kind: ToolKind.Ls;
+  readonly path?: string;
+}
+
+interface EditIntent extends BaseToolIntent {
+  readonly kind: ToolKind.Edit;
+  readonly path: string;
+  readonly editCount: number;
+}
+
+interface WriteIntent extends BaseToolIntent {
+  readonly kind: ToolKind.Write;
+  readonly path: string;
+}
+
+interface CustomIntent extends BaseToolIntent {
+  readonly kind: ToolKind.Custom;
+  readonly toolName: string;
+}
+
+enum CompletedStopReason {
+  Stop = "stop",
+  Length = "length",
+  Error = "error",
+  Aborted = "aborted",
+}
+
+enum FactKind {
+  MessageUpdate = "message_update",
+  ToolStart = "tool_start",
+  ToolEnd = "tool_end",
+  MessageEnd = "message_end",
+}
+
+enum ToolKind {
+  Bash = "bash",
+  Read = "read",
+  Grep = "grep",
+  Find = "find",
+  Ls = "ls",
+  Edit = "edit",
+  Write = "write",
+  Custom = "custom",
+}
+
+enum Urgency {
+  Debounced = "debounced",
+  Now = "now",
+}
+
+type ModelSelectorRegistry = ConstructorParameters<
+  typeof ModelSelectorComponent
+>[3];
+
+const FAST_MODEL_CANDIDATES: readonly ModelCandidate[] = [
+  { provider: "anthropic", id: "claude-haiku-4-5" },
+  { provider: "anthropic", id: "claude-haiku-4-5-20251001" },
+  { provider: "openai-codex", id: "gpt-5.4-mini" },
+  { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
+  { provider: "openai-codex", id: "gpt-5.2" },
+  { provider: "openai-codex", id: "gpt-5.3-codex" },
+  { provider: "openai-codex", id: "gpt-5.4" },
+  { provider: "openai-codex", id: "gpt-5.5" },
+  { provider: "anthropic", id: "claude-sonnet-4-5" },
+  { provider: "anthropic", id: "claude-sonnet-4-5-20250929" },
+  { provider: "anthropic", id: "claude-sonnet-4-6" },
+  { provider: "anthropic", id: "claude-opus-4-1" },
+  { provider: "anthropic", id: "claude-opus-4-1-20250805" },
+  { provider: "anthropic", id: "claude-opus-4-5" },
+  { provider: "anthropic", id: "claude-opus-4-5-20251101" },
+  { provider: "anthropic", id: "claude-opus-4-6" },
+  { provider: "anthropic", id: "claude-opus-4-7" },
 ];
 
 const AUTOMATIC_TLDR_MODEL: Model<Api> = {
-	id: AUTOMATIC_MODEL_CHOICE,
-	name: "Automatic",
-	api: "pi-tldr-automatic",
-	provider: AUTOMATIC_MODEL_PROVIDER,
-	baseUrl: "",
-	reasoning: false,
-	input: ["text"],
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	contextWindow: 0,
-	maxTokens: 0,
+  id: AUTOMATIC_MODEL_CHOICE,
+  name: "Automatic",
+  api: "pi-tldr-automatic",
+  provider: AUTOMATIC_MODEL_PROVIDER,
+  baseUrl: "",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 0,
+  maxTokens: 0,
 };
 
-const MODEL_SELECTOR_SETTINGS = {
-	setDefaultModelAndProvider() {
-		// pi-tldr stores its own model preference instead of changing pi's default model.
-	},
-} as unknown as ModelSelectorSettings;
+const MODEL_SELECTOR_SETTINGS = SettingsManager.inMemory();
 
-/**
- * The only place that shapes visible TLDR wording. The code validates output
- * format; it does not maintain phrase-specific fallbacks.
- */
 const TLDR_SYSTEM_PROMPT = `You write live status TLDRs for a terminal coding agent.
 Return one short, complete, plain-English sentence.
 The sentence must be complete and must not trail off.
 Describe the current workflow step for the user's task.
 For in-progress work, start with a present-tense action verb form ending in -ing.
 For final results or completed work, start with a past-tense action verb.
-For final-result context, summarize what was accomplished instead of quoting or paraphrasing the response.
-Be specific enough to show progress, but do not mention individual files, raw tool arguments, or tiny edits.
 Do not use first person.
 Do not address the user directly.
 Do not speak as the assistant.
-Do not output JSON, markdown, code, raw logs, raw diffs, XML, bullet points, or quoted strings.
-Do not mention tool names, command names, or raw arguments.
-Do not say generic phrases like "working", "thinking", "processing", "using a tool", "running a command", or "reviewing code".
-Do not mention that you are an AI, and do not add punctuation beyond the sentence.
-Output only the TLDR sentence. It must be short and complete.`;
+Do not output JSON, markdown, code, logs, diffs, XML, bullet points, or quoted strings.
+Do not mention tool names, command names, raw arguments, or individual file names.
+Output only the TLDR sentence.`;
 
-type FastModelAuth = {
-	model: Model<Api>;
-	apiKey: string;
-	headers?: Record<string, string>;
-};
-
-/**
- * All mutable state for the extension. Event handlers mutate this object as
- * simple state transitions; helpers do not own hidden state outside it.
- */
-type RuntimeState = {
-	active: boolean;
-	/** User-selected model tried before the default candidate list. */
-	preferredModel: ModelCandidate | undefined;
-	/** Lets async LLM calls detect that the session/request changed before rendering. */
-	generation: number;
-	/** Invalidates older LLM calls within the same request when newer facts arrive. */
-	refinementGeneration: number;
-	prompt: string;
-	activity: string[];
-	currentSummary: string;
-	lastFacts: string;
-	lastLlmStart: number;
-	pendingFacts: string | undefined;
-	updateTimer: ReturnType<typeof setTimeout> | undefined;
-	activeRequest: AbortController | undefined;
-	toolArgsById: Map<string, unknown>;
-};
-
-/**
- * Captured when an LLM request starts. The generation numbers let the response
- * prove it still belongs to the latest session/request before it renders.
- */
-type RefinementRequest = {
-	facts: string;
-	generation: number;
-	refinementGeneration: number;
-};
-
-type Urgency = "debounced" | "now";
-
-/**
- * Small presentation-only component. All TLDR policy lives outside the TUI layer.
- */
 class PiTldrBox implements Component {
-	constructor(
-		private readonly theme: Theme,
-		private readonly summary: string,
-	) {}
+  public constructor(
+    private readonly theme: Theme,
+    private readonly summary: string,
+  ) {}
 
-	invalidate(): void {
-		// Stateless: render uses the current theme proxy and summary.
-	}
+  public invalidate(): void {
+    // Stateless: render uses constructor data.
+  }
 
-	render(width: number): string[] {
-		if (width < MIN_BOX_WIDTH) return [`${TITLE.trim()}: ${this.summary}`];
+  public render(width: number): string[] {
+    if (width < MIN_BOX_WIDTH) return [`${TITLE.trim()}: ${this.summary}`];
 
-		const contentWidth = width - 4;
-		const lines = wrapTextWithAnsi(this.summary, contentWidth);
-		return [
-			this.topBorder(width),
-			...(lines.length === 0 ? [""] : lines).map((line) => this.contentLine(line, contentWidth)),
-			this.bottomBorder(width),
-		];
-	}
+    const contentWidth = width - 4;
+    const lines = wrapTextWithAnsi(this.summary, contentWidth);
+    return [
+      this.topBorder(width),
+      ...(lines.length === 0 ? [""] : lines).map((line) =>
+        this.contentLine(line, contentWidth),
+      ),
+      this.bottomBorder(width),
+    ];
+  }
 
-	private topBorder(width: number): string {
-		const rightWidth = Math.max(1, width - visibleWidth(TITLE) - 2);
-		return this.theme.fg("borderMuted", `╭${TITLE}${"─".repeat(rightWidth)}╮`);
-	}
+  private topBorder(width: number): string {
+    const rightWidth = Math.max(1, width - visibleWidth(TITLE) - 2);
+    return this.theme.fg("borderMuted", `╭${TITLE}${"─".repeat(rightWidth)}╮`);
+  }
 
-	private bottomBorder(width: number): string {
-		return this.theme.fg("borderMuted", `╰${"─".repeat(width - 2)}╯`);
-	}
+  private bottomBorder(width: number): string {
+    return this.theme.fg("borderMuted", `╰${"─".repeat(width - 2)}╯`);
+  }
 
-	private contentLine(line: string, contentWidth: number): string {
-		const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(line)));
-		return [
-			this.theme.fg("borderMuted", "│ "),
-			this.theme.fg("text", line),
-			padding,
-			this.theme.fg("borderMuted", " │"),
-		].join("");
-	}
+  private contentLine(line: string, contentWidth: number): string {
+    const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(line)));
+    return [
+      this.theme.fg("borderMuted", "│ "),
+      this.theme.fg("text", line),
+      padding,
+      this.theme.fg("borderMuted", " │"),
+    ].join("");
+  }
 }
 
-/**
- * Creates the state object used by all handlers for one extension instance.
- */
 function createInitialState(): RuntimeState {
-	return {
-		active: false,
-		preferredModel: undefined,
-		generation: 0,
-		refinementGeneration: 0,
-		prompt: "",
-		activity: [],
-		currentSummary: "",
-		lastFacts: "",
-		lastLlmStart: 0,
-		pendingFacts: undefined,
-		updateTimer: undefined,
-		activeRequest: undefined,
-		toolArgsById: new Map(),
-	};
+  return {
+    active: false,
+    generation: 0,
+    refinementGeneration: 0,
+    prompt: "",
+    activity: [],
+    currentSummary: "",
+    lastFacts: "",
+    lastLlmStart: 0,
+    toolIntentById: new Map(),
+  };
 }
 
-/**
- * Clears the TLDR widget when a TUI is available.
- */
 function clearWidget(ctx: ExtensionContext): void {
-	if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
+  if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
 }
 
-/**
- * Renders text that has already passed extractSummary()/renderSummary(). Keeping
- * validation out of this function makes the rendering boundary small.
- */
 function showWidget(ctx: ExtensionContext, summary: string): void {
-	if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => new PiTldrBox(theme, summary));
+  if (!ctx.hasUI) return;
+  ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => {
+    void tui;
+    return new PiTldrBox(theme, summary);
+  });
 }
 
-/**
- * Collapses whitespace for both visible summaries and internal fact payloads.
- */
+function notifyUser(
+  ctx: ExtensionContext,
+  message: string,
+  level: "info" | "error",
+): void {
+  if (ctx.hasUI) ctx.ui.notify(message, level);
+}
+
 function normalizeText(text: string): string {
-	return text.replace(/\s+/g, " ").trim();
+  return text.replace(/\s+/g, " ").trim();
 }
 
-/**
- * Normalizes text and optionally limits it to a character budget using an
- * ellipsis. Used for model facts, not terminal-width wrapping.
- */
 function truncateText(text: string, maxChars?: number): string {
-	const normalized = normalizeText(text);
-	if (maxChars === undefined) return normalized;
-	return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars - 1)}…`;
+  const normalized = normalizeText(text);
+  if (maxChars === undefined) return normalized;
+  if (maxChars <= 0) return "";
+  return normalized.length <= maxChars
+    ? normalized
+    : `${normalized.slice(0, maxChars - 1)}…`;
 }
 
-/**
- * Detects obvious JSON-like output so raw structured data never becomes visible
- * TLDR text.
- */
-function looksLikeStructuredData(text: string): boolean {
-	const trimmed = text.trim();
-	return (
-		((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) &&
-		/[{}[\]":,]/.test(trimmed)
-	);
-}
-
-/**
- * Narrows unknown extension event payload values before reading fields.
- */
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-	return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
-}
-
-/**
- * Serializes unknown event payloads for model-only context. Serialization
- * failures produce an empty fact instead of leaking an exception into handlers.
- */
-function safeJsonPreview(value: unknown): string {
-	try {
-		return JSON.stringify(value) ?? "";
-	} catch {
-		return "";
-	}
-}
-
-/**
- * Removes ANSI escape sequences before sending facts to models or rendering
- * accepted summaries.
- */
 function stripAnsi(text: string): string {
-	return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  return text.replace(ANSI_PATTERN, "");
 }
 
-/**
- * Extracts text blocks from assistant messages while ignoring thinking blocks,
- * tool calls, images, and malformed extension payloads.
- */
-function extractAssistantText(message: { content?: unknown } | undefined): string | undefined {
-	if (!Array.isArray(message?.content)) return undefined;
-
-	const text = message.content
-		.map((item) => {
-			const content = asRecord(item);
-			return content?.type === "text" && typeof content.text === "string" ? content.text : undefined;
-		})
-		.filter((item): item is string => item !== undefined)
-		.join("\n")
-		.trim();
-
-	return text || undefined;
+function redactSensitiveText(text: string): string {
+  return text
+    .replace(PRIVATE_KEY_PATTERN, "[REDACTED_PRIVATE_KEY]")
+    .replace(TOKEN_PATTERN, "[REDACTED_TOKEN]")
+    .replace(SECRET_ASSIGNMENT_PATTERN, "$1=[REDACTED_SECRET]");
 }
 
-/**
- * Converts opaque tool args/results into compact model facts. Unlike visible
- * summaries, facts may be JSON, so punctuation and field names are preserved.
- */
-function compactEventFacts(value: unknown): string {
-	return truncateText(stripAnsi(safeJsonPreview(value)), MAX_FACT_CHARS);
+function sanitizeModelText(text: string): string {
+  return redactSensitiveText(stripAnsi(text));
 }
 
-/**
- * Formats extension model candidates as the user-facing `provider/model-id`
- * syntax accepted by flags, commands, and saved config.
- */
-function formatModelSpec(candidate: ModelCandidate): string {
-	return `${candidate.provider}/${candidate.id}`;
+function factField(name: string, value: string, maxChars?: number): string {
+  return `${name}=${truncateText(sanitizeModelText(value), maxChars)}`;
 }
 
-/**
- * Formats registry models with the same syntax used by ModelCandidate helpers.
- */
-function formatRegistryModel(model: Model<Api>): string {
-	return `${model.provider}/${model.id}`;
+function pathDescriptor(path: string): string {
+  const extension = extname(path);
+  const kind = isAbsolute(path) ? "absolute" : "relative";
+  return extension ? `${kind} ${extension.slice(1)} file` : `${kind} path`;
 }
 
-/**
- * Parses a loose user/config value into a provider/model-id pair. Support-list
- * validation is intentionally separate so callers can choose strictness.
- */
-function parseModelSpec(value: unknown): ModelCandidate | undefined {
-	if (typeof value !== "string") return undefined;
-
-	const trimmed = value.trim();
-	const separator = trimmed.indexOf("/");
-	if (separator <= 0 || separator === trimmed.length - 1) return undefined;
-
-	return {
-		provider: trimmed.slice(0, separator),
-		id: trimmed.slice(separator + 1),
-	};
+function isJsonObject(value: JsonValue): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * Restricts TLDR model selection to models that were verified to return short,
- * completed status summaries through pi's provider path.
- */
+function isAssistantMessage(
+  message: AgentMessage,
+): message is AssistantMessage {
+  return "role" in message && message.role === "assistant";
+}
+
+function isTextContent(content: TextSourceContent): content is TextContent {
+  return content.type === "text";
+}
+
+function extractTextContent(
+  content: readonly TextSourceContent[],
+): string | undefined {
+  const text = content
+    .filter(isTextContent)
+    .map(({ text }) => text)
+    .join("\n")
+    .trim();
+  return text || undefined;
+}
+
+function extractToolResultText(event: ToolResultEvent): string | undefined {
+  return extractTextContent(event.content);
+}
+
+function completedStopReason(
+  stopReason: AssistantMessage["stopReason"],
+): CompletedStopReason | undefined {
+  switch (stopReason) {
+    case CompletedStopReason.Stop:
+      return CompletedStopReason.Stop;
+    case CompletedStopReason.Length:
+      return CompletedStopReason.Length;
+    case CompletedStopReason.Error:
+      return CompletedStopReason.Error;
+    case CompletedStopReason.Aborted:
+      return CompletedStopReason.Aborted;
+    default:
+      return undefined;
+  }
+}
+
+function formatModelSpec({ provider, id }: ModelCandidate): string {
+  return `${provider}/${id}`;
+}
+
+function formatRegistryModel({ provider, id }: Model<Api>): string {
+  return `${provider}/${id}`;
+}
+
+function parseModelSpec(value: string): ModelCandidate | undefined {
+  const trimmed = value.trim();
+  const separator = trimmed.indexOf("/");
+  if (separator <= 0 || separator === trimmed.length - 1) return undefined;
+  return {
+    provider: trimmed.slice(0, separator),
+    id: trimmed.slice(separator + 1),
+  };
+}
+
+function parseModelFlag(
+  value: string | boolean | undefined,
+): ModelCandidate | undefined {
+  return typeof value === "string" ? parseSupportedModelSpec(value) : undefined;
+}
+
 function isSupportedTldrModel(candidate: ModelCandidate): boolean {
-	return FAST_MODEL_CANDIDATES.some((supported) => formatModelSpec(supported) === formatModelSpec(candidate));
+  return FAST_MODEL_CANDIDATES.some(
+    (supported) => formatModelSpec(supported) === formatModelSpec(candidate),
+  );
 }
 
-/**
- * Parses and validates a user/config model value against the supported TLDR set.
- */
-function parseSupportedModelSpec(value: unknown): ModelCandidate | undefined {
-	const candidate = parseModelSpec(value);
-	return candidate && isSupportedTldrModel(candidate) ? candidate : undefined;
+function parseSupportedModelSpec(value: string): ModelCandidate | undefined {
+  const candidate = parseModelSpec(value);
+  return candidate && isSupportedTldrModel(candidate) ? candidate : undefined;
 }
 
-/**
- * Builds the comma-separated model list shown in command validation errors.
- */
 function supportedModelList(): string {
-	return FAST_MODEL_CANDIDATES.map(formatModelSpec).join(", ");
+  return FAST_MODEL_CANDIDATES.map(formatModelSpec).join(", ");
 }
 
-/**
- * Returns the model trial order, placing a direct user preference first while
- * preserving automatic fallback candidates without duplicates.
- */
-function modelCandidates(preferredModel?: ModelCandidate): ReadonlyArray<ModelCandidate> {
-	if (!preferredModel) return FAST_MODEL_CANDIDATES;
-
-	return [
-		preferredModel,
-		...FAST_MODEL_CANDIDATES.filter((candidate) => formatModelSpec(candidate) !== formatModelSpec(preferredModel)),
-	];
+function modelCandidates(
+  preferredModel?: ModelCandidate,
+): readonly ModelCandidate[] {
+  if (!preferredModel) return FAST_MODEL_CANDIDATES;
+  return [
+    preferredModel,
+    ...FAST_MODEL_CANDIDATES.filter(
+      (candidate) =>
+        formatModelSpec(candidate) !== formatModelSpec(preferredModel),
+    ),
+  ];
 }
 
-/**
- * Resolves the extension-owned preference file inside pi's active agent config
- * directory, honoring `PI_CODING_AGENT_DIR` through getAgentDir().
- */
 function tldrConfigPath(): string {
-	return join(getAgentDir(), TLDR_MODEL_CONFIG_FILE);
+  return join(getAgentDir(), TLDR_MODEL_CONFIG_FILE);
 }
 
-/**
- * Global extension preference stored outside session history. Pi has session
- * persistence and CLI flags, but no public namespaced global settings writer.
- */
+function parsePreferredModelConfig(configText: string): string | undefined {
+  try {
+    const value = JSON.parse(configText) as JsonValue;
+    return isJsonObject(value) && typeof value.model === "string"
+      ? value.model
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function loadPreferredModel(): ModelCandidate | undefined {
-	try {
-		const path = tldrConfigPath();
-		if (!existsSync(path)) return undefined;
+  try {
+    const path = tldrConfigPath();
+    if (!existsSync(path)) return undefined;
 
-		const data = asRecord(JSON.parse(readFileSync(path, "utf8")));
-		return parseSupportedModelSpec(data?.model);
-	} catch {
-		return undefined;
-	}
+    const modelSpec = parsePreferredModelConfig(readFileSync(path, "utf8"));
+    return modelSpec ? parseSupportedModelSpec(modelSpec) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-/**
- * Persists a validated TLDR model preference. Returns false when the preference
- * was applied for this session but could not be written globally.
- */
-function savePreferredModel(preferredModel: ModelCandidate): boolean {
-	try {
-		const path = tldrConfigPath();
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${JSON.stringify({ model: formatModelSpec(preferredModel) }, null, 2)}\n`);
-		return true;
-	} catch {
-		return false;
-	}
+function savePreferredModel(
+  preferredModel: ModelCandidate,
+): PreferenceOperationResult {
+  const path = tldrConfigPath();
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      path,
+      `${JSON.stringify({ model: formatModelSpec(preferredModel) }, null, 2)}\n`,
+    );
+    return { ok: true };
+  } catch {
+    return { ok: false, message: "preference could not be saved" };
+  }
 }
 
-/**
- * Removes the saved preference so future sessions return to automatic TLDR
- * model selection.
- */
-function clearPreferredModel(): boolean {
-	try {
-		const path = tldrConfigPath();
-		if (existsSync(path)) rmSync(path);
-		return true;
-	} catch {
-		return false;
-	}
+function clearPreferredModel(): PreferenceOperationResult {
+  try {
+    rmSync(tldrConfigPath(), { force: true });
+    return { ok: true };
+  } catch {
+    return { ok: false, message: "saved preference could not be removed" };
+  }
 }
 
-/**
- * Identifies the synthetic `auto` row injected into the model selector.
- */
-function isAutomaticModel(model: Model<Api>): boolean {
-	return model.provider === AUTOMATIC_MODEL_PROVIDER && model.id === AUTOMATIC_MODEL_CHOICE;
+function isAutomaticModel({ provider, id }: Model<Api>): boolean {
+  return provider === AUTOMATIC_MODEL_PROVIDER && id === AUTOMATIC_MODEL_CHOICE;
 }
 
-/**
- * Wraps pi's model registry for the selector so `/tldr-model` only exposes the
- * synthetic `auto` row plus supported TLDR models with configured auth.
- */
-function createModelSelectorRegistry(ctx: ExtensionContext): ModelSelectorRegistry {
-	return new Proxy(ctx.modelRegistry, {
-		get(target, property, receiver) {
-			if (property === "find") {
-				return (provider: string, id: string) =>
-					provider === AUTOMATIC_MODEL_PROVIDER && id === AUTOMATIC_MODEL_CHOICE
-						? AUTOMATIC_TLDR_MODEL
-						: target.find(provider, id);
-			}
+function createModelSelectorRegistry(
+  ctx: ExtensionContext,
+): ModelSelectorRegistry {
+  return new Proxy(ctx.modelRegistry, {
+    get(target, property, receiver) {
+      if (property === "find") {
+        return (provider: string, id: string) =>
+          provider === AUTOMATIC_MODEL_PROVIDER && id === AUTOMATIC_MODEL_CHOICE
+            ? AUTOMATIC_TLDR_MODEL
+            : target.find(provider, id);
+      }
 
-			if (property === "getAvailable") {
-				return () => {
-					const availableBySpec = new Map(target.getAvailable().map((model) => [formatRegistryModel(model), model]));
-					return [
-						AUTOMATIC_TLDR_MODEL,
-						...FAST_MODEL_CANDIDATES.map(formatModelSpec)
-							.map((spec) => availableBySpec.get(spec))
-							.filter((model): model is Model<Api> => model !== undefined),
-					];
-				};
-			}
+      if (property === "getAvailable") {
+        return () => {
+          const availableBySpec = new Map(
+            target
+              .getAvailable()
+              .map((model) => [formatRegistryModel(model), model]),
+          );
+          return [
+            AUTOMATIC_TLDR_MODEL,
+            ...FAST_MODEL_CANDIDATES.map(formatModelSpec)
+              .map((spec) => availableBySpec.get(spec))
+              .filter((model): model is Model<Api> => model !== undefined),
+          ];
+        };
+      }
 
-			const value = Reflect.get(target, property, receiver);
-			return typeof value === "function" ? value.bind(target) : value;
-		},
-	}) as ModelSelectorRegistry;
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as ModelSelectorRegistry;
 }
 
-/**
- * Opens pi's reusable model selector and converts the selection into the command
- * value handled by `/tldr-model`.
- */
-async function selectTldrModel(ctx: ExtensionContext, state: RuntimeState): Promise<string | undefined> {
-	const selectorRegistry = createModelSelectorRegistry(ctx);
-	const currentModel = state.preferredModel
-		? selectorRegistry.find(state.preferredModel.provider, state.preferredModel.id)
-		: AUTOMATIC_TLDR_MODEL;
+async function selectTldrModel(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+): Promise<string | undefined> {
+  const selectorRegistry = createModelSelectorRegistry(ctx);
+  const currentModel = state.preferredModel
+    ? (selectorRegistry.find(
+        state.preferredModel.provider,
+        state.preferredModel.id,
+      ) ?? AUTOMATIC_TLDR_MODEL)
+    : AUTOMATIC_TLDR_MODEL;
 
-	const selectedModel = await ctx.ui.custom<Model<Api> | undefined>((tui, _theme, _keybindings, done) =>
-		new ModelSelectorComponent(
-			tui,
-			currentModel,
-			MODEL_SELECTOR_SETTINGS,
-			selectorRegistry,
-			[],
-			(model) => done(model),
-			() => done(undefined),
-		),
-	);
+  const selectedModel = await ctx.ui.custom<Model<Api> | undefined>(
+    (tui, theme, keybindings, done) => {
+      void theme;
+      void keybindings;
+      return new ModelSelectorComponent(
+        tui,
+        currentModel,
+        MODEL_SELECTOR_SETTINGS,
+        selectorRegistry,
+        [],
+        (model) => done(model),
+        () => done(undefined),
+      );
+    },
+  );
 
-	if (!selectedModel) return undefined;
-	return isAutomaticModel(selectedModel) ? AUTOMATIC_MODEL_CHOICE : formatRegistryModel(selectedModel);
+  if (!selectedModel) return undefined;
+  return isAutomaticModel(selectedModel)
+    ? AUTOMATIC_MODEL_CHOICE
+    : formatRegistryModel(selectedModel);
 }
 
-/**
- * Starts a new request fact set with the user's prompt and empty activity.
- */
+function createToolIntent(event: ToolCallEvent): ToolIntent {
+  if (isToolCallEventType("bash", event)) {
+    return {
+      kind: ToolKind.Bash,
+      toolCallId: event.toolCallId,
+      command: event.input.command,
+    };
+  }
+  if (isToolCallEventType("read", event)) {
+    const { path, offset, limit } = event.input;
+    return {
+      kind: ToolKind.Read,
+      toolCallId: event.toolCallId,
+      path,
+      offset,
+      limit,
+    };
+  }
+  if (isToolCallEventType("grep", event)) {
+    const { pattern, path, glob } = event.input;
+    return {
+      kind: ToolKind.Grep,
+      toolCallId: event.toolCallId,
+      pattern,
+      path,
+      glob,
+    };
+  }
+  if (isToolCallEventType("find", event)) {
+    const { pattern, path } = event.input;
+    return { kind: ToolKind.Find, toolCallId: event.toolCallId, pattern, path };
+  }
+  if (isToolCallEventType("ls", event)) {
+    return {
+      kind: ToolKind.Ls,
+      toolCallId: event.toolCallId,
+      path: event.input.path,
+    };
+  }
+  if (isToolCallEventType("edit", event)) {
+    return {
+      kind: ToolKind.Edit,
+      toolCallId: event.toolCallId,
+      path: event.input.path,
+      editCount: event.input.edits.length,
+    };
+  }
+  if (isToolCallEventType("write", event)) {
+    return {
+      kind: ToolKind.Write,
+      toolCallId: event.toolCallId,
+      path: event.input.path,
+    };
+  }
+  return {
+    kind: ToolKind.Custom,
+    toolCallId: event.toolCallId,
+    toolName: event.toolName,
+  };
+}
+
+function toolIntentLines(intent: ToolIntent): string[] {
+  switch (intent.kind) {
+    case ToolKind.Bash:
+      return ["tool=bash", factField("command", intent.command, 240)];
+    case ToolKind.Read:
+      return [
+        "tool=read",
+        factField("path", pathDescriptor(intent.path)),
+        intent.offset === undefined
+          ? undefined
+          : `offset=${String(intent.offset)}`,
+        intent.limit === undefined
+          ? undefined
+          : `limit=${String(intent.limit)}`,
+      ].filter((line): line is string => line !== undefined);
+    case ToolKind.Grep:
+      return [
+        "tool=grep",
+        factField("pattern", intent.pattern, 160),
+        intent.path
+          ? factField("path", pathDescriptor(intent.path))
+          : undefined,
+        intent.glob ? factField("glob", intent.glob) : undefined,
+      ].filter((line): line is string => line !== undefined);
+    case ToolKind.Find:
+      return [
+        "tool=find",
+        factField("pattern", intent.pattern, 160),
+        intent.path
+          ? factField("path", pathDescriptor(intent.path))
+          : undefined,
+      ].filter((line): line is string => line !== undefined);
+    case ToolKind.Ls:
+      return [
+        "tool=ls",
+        intent.path
+          ? factField("path", pathDescriptor(intent.path))
+          : undefined,
+      ].filter((line): line is string => line !== undefined);
+    case ToolKind.Edit:
+      return [
+        "tool=edit",
+        factField("path", pathDescriptor(intent.path)),
+        `editCount=${String(intent.editCount)}`,
+      ];
+    case ToolKind.Write:
+      return ["tool=write", factField("path", pathDescriptor(intent.path))];
+    case ToolKind.Custom:
+      return ["tool=custom", factField("toolName", intent.toolName)];
+    default:
+      return assertNever(intent);
+  }
+}
+
+function formatFact(fact: TldrFact): string {
+  switch (fact.kind) {
+    case FactKind.MessageUpdate:
+      return [
+        "event=message_update",
+        factField("assistantText", fact.assistantText),
+      ].join("\n");
+    case FactKind.ToolStart:
+      return ["event=tool_start", ...toolIntentLines(fact.intent)].join("\n");
+    case FactKind.ToolEnd:
+      return [
+        "event=tool_end",
+        fact.intent ? undefined : factField("toolName", fact.toolName),
+        `isError=${String(fact.isError)}`,
+        fact.resultText
+          ? factField("result", fact.resultText, MAX_FACT_CHARS)
+          : undefined,
+        ...(fact.intent ? toolIntentLines(fact.intent) : []),
+      ]
+        .filter((line): line is string => line !== undefined)
+        .join("\n");
+    case FactKind.MessageEnd:
+      return [
+        "event=message_end",
+        `stopReason=${fact.stopReason}`,
+        fact.errorMessage
+          ? factField("errorMessage", fact.errorMessage)
+          : undefined,
+        fact.finalResultContext
+          ? factField("finalResultContext", fact.finalResultContext)
+          : undefined,
+      ]
+        .filter((line): line is string => line !== undefined)
+        .join("\n");
+    default:
+      return assertNever(fact);
+  }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled TLDR variant: ${String(value)}`);
+}
+
 function resetFacts(state: RuntimeState, prompt?: string): void {
-	state.prompt = truncateText(stripAnsi(prompt ?? ""), MAX_PROMPT_CHARS);
-	state.activity.length = 0;
+  state.prompt = truncateText(
+    sanitizeModelText(prompt ?? ""),
+    MAX_PROMPT_CHARS,
+  );
+  state.activity.splice(0);
 }
 
-/**
- * Adds a deduped, bounded event fact so the TLDR model sees recent intent
- * without being overwhelmed by streaming updates or repeated tool events.
- */
-function addFact(state: RuntimeState, eventName: string, fields: Record<string, string | undefined> = {}): void {
-	const lines = [`event=${eventName}`];
-	for (const [key, value] of Object.entries(fields)) {
-		if (value) lines.push(`${key}=${value}`);
-	}
+function addFact(state: RuntimeState, fact: TldrFact): void {
+  const formattedFact = formatFact(fact);
+  if (
+    !formattedFact ||
+    state.activity[state.activity.length - 1] === formattedFact
+  )
+    return;
 
-	const fact = lines.join("\n");
-	if (state.activity[state.activity.length - 1] === fact) return;
-
-	state.activity.push(fact);
-	if (state.activity.length > MAX_ACTIVITY_HISTORY) {
-		state.activity.splice(0, state.activity.length - MAX_ACTIVITY_HISTORY);
-	}
+  state.activity.push(formattedFact);
+  if (state.activity.length > MAX_ACTIVITY_HISTORY) {
+    state.activity.splice(0, state.activity.length - MAX_ACTIVITY_HISTORY);
+  }
 }
 
-/**
- * Builds the exact payload sent to the TLDR model. Prompt context is kept first;
- * activity is selected from newest to oldest within the remaining budget.
- */
 function factsSnapshot(state: RuntimeState): string {
-	const promptLine = state.prompt ? `prompt=${state.prompt}` : undefined;
-	const activityBudget = MAX_FACT_CHARS - (promptLine ? promptLine.length + 1 : 0);
-	const recentActivity: string[] = [];
-	let remaining = Math.max(0, activityBudget);
+  const promptLine = state.prompt ? `prompt=${state.prompt}` : undefined;
+  const activityBudget =
+    MAX_FACT_CHARS - (promptLine ? promptLine.length + 1 : 0);
+  const recentActivity: string[] = [];
+  let remaining = Math.max(0, activityBudget);
 
-	// Preserve the newest facts first. Tool results arrive after tool calls, so
-	// keeping the tail avoids large args crowding out what the tool discovered.
-	for (let i = state.activity.length - 1; i >= 0 && remaining > 0; i--) {
-		const fact = state.activity[i];
-		if (!fact) continue;
+  for (
+    let index = state.activity.length - 1;
+    index >= 0 && remaining > 0;
+    index--
+  ) {
+    const fact = state.activity[index];
+    if (!fact) continue;
 
-		const separatorLength = recentActivity.length === 0 ? 0 : 1;
-		const needed = fact.length + separatorLength;
-		if (needed <= remaining) {
-			recentActivity.unshift(fact);
-			remaining -= needed;
-			continue;
-		}
+    const separatorLength = recentActivity.length === 0 ? 0 : 1;
+    const needed = fact.length + separatorLength;
+    if (needed <= remaining) {
+      recentActivity.unshift(fact);
+      remaining -= needed;
+      continue;
+    }
 
-		if (recentActivity.length === 0) recentActivity.unshift(truncateText(fact, remaining));
-		break;
-	}
+    if (recentActivity.length === 0)
+      recentActivity.unshift(truncateText(fact, remaining));
+    break;
+  }
 
-	return [promptLine, recentActivity.join("\n") || undefined]
-		.filter((item): item is string => item !== undefined)
-		.join("\n");
+  return [promptLine, recentActivity.join("\n") || undefined]
+    .filter((item): item is string => item !== undefined)
+    .join("\n");
 }
 
-/**
- * Validates format only. Visible wording should come from the model and prompt,
- * not hardcoded phrase checks.
- */
+function looksLikeStructuredData(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))) &&
+    STRUCTURED_TOKEN_PATTERN.test(trimmed)
+  );
+}
+
 function hasInvalidSummaryFormat(rawText: string, summary: string): boolean {
-	const raw = rawText.trim();
-	const invalidFormat = /^['"`]|['"`]$|```|`|\[[^\]]+]\([^)]*\)|^\s*[-*+]\s+|^\s*#{1,6}\s+|<[^>]+>/;
-	return (
-		!raw ||
-		invalidFormat.test(raw) ||
-		invalidFormat.test(summary) ||
-		looksLikeStructuredData(raw) ||
-		looksLikeStructuredData(summary)
-	);
+  const raw = rawText.trim();
+  return (
+    !raw ||
+    SUMMARY_FORMAT_PATTERN.test(raw) ||
+    SUMMARY_FORMAT_PATTERN.test(summary) ||
+    looksLikeStructuredData(raw) ||
+    looksLikeStructuredData(summary) ||
+    summary.length > MAX_SUMMARY_CHARS
+  );
 }
 
-/**
- * Converts raw LLM response text into the only thing that may become visible.
- * Returning undefined means "keep the previous accepted TLDR".
- */
 function extractSummary(response: string): string | undefined {
-	const lines = response.trim().split(/\r?\n/);
-	if (lines.length !== 1) return undefined;
+  const lines = response.trim().split(/\r?\n/);
+  if (lines.length !== 1) return undefined;
 
-	const rawLine = lines[0] ?? "";
-	const summary = normalizeText(stripAnsi(rawLine));
-	return summary && !hasInvalidSummaryFormat(rawLine, summary) ? summary : undefined;
+  const rawLine = lines[0] ?? "";
+  const summary = normalizeText(stripAnsi(rawLine));
+  return summary && !hasInvalidSummaryFormat(rawLine, summary)
+    ? summary
+    : undefined;
 }
 
-/**
- * Lazily finds the first configured fast model with usable auth.
- */
-async function getFastModelAuth(ctx: ExtensionContext, preferredModel?: ModelCandidate): Promise<FastModelAuth | undefined> {
-	for (const candidate of modelCandidates(preferredModel)) {
-		const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
-		if (!model) continue;
+async function getFastModelAuth(
+  ctx: ExtensionContext,
+  preferredModel?: ModelCandidate,
+): Promise<FastModelAuth | undefined> {
+  for (const candidate of modelCandidates(preferredModel)) {
+    const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
+    if (!model) continue;
 
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (auth.ok && auth.apiKey) return { model, apiKey: auth.apiKey, headers: auth.headers };
-	}
-	return undefined;
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (auth.ok && auth.apiKey)
+      return { model, apiKey: auth.apiKey, headers: auth.headers };
+  }
+  return undefined;
 }
 
-/**
- * Builds provider options for one TLDR completion. Codex intentionally omits
- * temperature because ChatGPT-backed Codex Responses rejects that parameter.
- */
-function createCompletionOptions(auth: FastModelAuth, signal: AbortSignal): ProviderStreamOptions {
-	const options: ProviderStreamOptions = {
-		apiKey: auth.apiKey,
-		headers: auth.headers,
-		maxTokens: TLDR_MAX_TOKENS,
-		maxRetries: 0,
-		signal,
-	};
+function createCompletionOptions(
+  auth: FastModelAuth,
+  signal: AbortSignal,
+): ProviderStreamOptions {
+  const options: ProviderStreamOptions = {
+    apiKey: auth.apiKey,
+    headers: auth.headers,
+    maxTokens: TLDR_MAX_TOKENS,
+    maxRetries: 0,
+    signal,
+  };
 
-	// ChatGPT-backed Codex Responses rejects `temperature`; other providers use it
-	// to keep TLDR wording stable without introducing retries or fallbacks.
-	if (auth.model.provider !== "openai-codex") options.temperature = 0.2;
-
-	return options;
+  if (auth.model.provider !== "openai-codex") options.temperature = 0.2;
+  return options;
 }
 
-/**
- * Cancels pending work at request/session boundaries so stale TLDRs cannot render.
- */
 function clearPendingWork(state: RuntimeState): void {
-	if (state.updateTimer) clearTimeout(state.updateTimer);
-	state.updateTimer = undefined;
-	state.pendingFacts = undefined;
-	state.activeRequest?.abort();
-	state.activeRequest = undefined;
+  state.refinementGeneration++;
+  if (state.updateTimer) clearTimeout(state.updateTimer);
+  state.updateTimer = undefined;
+  state.pendingRequest = undefined;
+  state.activeRequest?.abort();
+  state.activeRequest = undefined;
 }
 
-/**
- * Checks whether an async LLM result still belongs to the latest request/fact set.
- */
 function isCurrent(state: RuntimeState, request: RefinementRequest): boolean {
-	return (
-		state.active &&
-		request.generation === state.generation &&
-		request.refinementGeneration === state.refinementGeneration
-	);
+  return (
+    state.active &&
+    request.generation === state.generation &&
+    request.refinementGeneration === state.refinementGeneration
+  );
 }
 
-/**
- * Final render gate: skips duplicate accepted summaries, then updates state/UI.
- */
-function renderSummary(ctx: ExtensionContext, state: RuntimeState, summary: string): void {
-	if (summary === state.currentSummary) return;
+function renderSummary(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  summary: string,
+): void {
+  if (summary === state.currentSummary) return;
 
-	state.currentSummary = summary;
-	showWidget(ctx, summary);
+  state.currentSummary = summary;
+  showWidget(ctx, summary);
 }
 
-/**
- * Schedules the next TLDR refinement. New facts replace pending facts and abort
- * active generation so older model output cannot overwrite newer state.
- */
-function requestRefinement(ctx: ExtensionContext, state: RuntimeState, urgency: Urgency): void {
-	if (!ctx.hasUI) return;
+function requestRefinement(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  urgency: Urgency,
+): void {
+  if (!ctx.hasUI) return;
 
-	const facts = factsSnapshot(state);
-	if (!facts || facts === state.lastFacts) return;
+  const facts = factsSnapshot(state);
+  if (!facts || facts === state.lastFacts) return;
 
-	state.lastFacts = facts;
-	state.pendingFacts = facts;
-	state.refinementGeneration++;
-	state.activeRequest?.abort();
-	state.activeRequest = undefined;
+  state.lastFacts = facts;
+  state.refinementGeneration++;
+  state.pendingRequest = {
+    facts,
+    generation: state.generation,
+    refinementGeneration: state.refinementGeneration,
+  };
+  state.activeRequest?.abort();
+  state.activeRequest = undefined;
 
-	if (state.updateTimer) clearTimeout(state.updateTimer);
-	const elapsedSinceLastLlm = Date.now() - state.lastLlmStart;
-	const delay = urgency === "now" ? 0 : Math.max(0, LLM_UPDATE_INTERVAL_MS - elapsedSinceLastLlm);
-	state.updateTimer = setTimeout(() => flushRefinement(ctx, state), delay);
+  if (state.updateTimer) clearTimeout(state.updateTimer);
+  const elapsedSinceLastLlm = Date.now() - state.lastLlmStart;
+  const delay =
+    urgency === Urgency.Now
+      ? 0
+      : Math.max(0, LLM_UPDATE_INTERVAL_MS - elapsedSinceLastLlm);
+  state.updateTimer = setTimeout(() => flushRefinement(ctx, state), delay);
 }
 
-/**
- * Timer callback that captures pending facts and starts the async LLM request.
- */
 function flushRefinement(ctx: ExtensionContext, state: RuntimeState): void {
-	state.updateTimer = undefined;
-	const facts = state.pendingFacts;
-	state.pendingFacts = undefined;
-	if (!facts) return;
+  state.updateTimer = undefined;
+  const request = state.pendingRequest;
+  state.pendingRequest = undefined;
+  if (!request) return;
 
-	void generateSummary(ctx, state, {
-		facts,
-		generation: state.generation,
-		refinementGeneration: state.refinementGeneration,
-	});
+  void generateSummary(ctx, state, request);
 }
 
-/**
- * Calls the fast model once. On auth/model/output failure, the extension keeps
- * the previous accepted TLDR instead of fabricating a fallback status.
- */
-async function generateSummary(ctx: ExtensionContext, state: RuntimeState, request: RefinementRequest): Promise<void> {
-	if (!isCurrent(state, request)) return;
+async function generateSummary(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  request: RefinementRequest,
+): Promise<void> {
+  if (!isCurrent(state, request)) return;
 
-	let auth: FastModelAuth | undefined;
-	try {
-		auth = await getFastModelAuth(ctx, state.preferredModel);
-	} catch {
-		return;
-	}
-	if (!auth || !isCurrent(state, request)) return;
+  let auth: FastModelAuth | undefined;
+  try {
+    auth = await getFastModelAuth(ctx, state.preferredModel);
+  } catch {
+    return;
+  }
+  if (!auth || !isCurrent(state, request)) return;
 
-	const abortController = new AbortController();
-	state.activeRequest = abortController;
-	state.lastLlmStart = Date.now();
+  const abortController = new AbortController();
+  state.activeRequest = abortController;
+  state.lastLlmStart = Date.now();
 
-	try {
-		const message: UserMessage = {
-			role: "user",
-			content: [{ type: "text", text: `Current event facts:\n${truncateText(request.facts, MAX_FACT_CHARS)}` }],
-			timestamp: Date.now(),
-		};
-		const response = await complete(
-			auth.model,
-			{ systemPrompt: TLDR_SYSTEM_PROMPT, messages: [message] },
-			createCompletionOptions(auth, abortController.signal),
-		);
-		if (!isCurrent(state, request) || response.stopReason !== "stop") return;
+  try {
+    const message: UserMessage = {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: `Current event facts:\n${truncateText(request.facts, MAX_FACT_CHARS)}`,
+        },
+      ],
+      timestamp: Date.now(),
+    };
+    const response = await complete(
+      auth.model,
+      { systemPrompt: TLDR_SYSTEM_PROMPT, messages: [message] },
+      createCompletionOptions(auth, abortController.signal),
+    );
+    if (!isCurrent(state, request) || response.stopReason !== "stop") return;
 
-		const responseText = response.content
-			.filter((item): item is { type: "text"; text: string } => item.type === "text")
-			.map((item) => item.text)
-			.join("\n");
-		const summary = extractSummary(responseText);
-		if (summary) renderSummary(ctx, state, summary);
-	} catch {
-		// Keep the previous accepted TLDR if refinement fails.
-	} finally {
-		if (state.activeRequest === abortController) state.activeRequest = undefined;
-	}
+    const responseText = extractTextContent(response.content) ?? "";
+    const summary = extractSummary(responseText);
+    if (summary) renderSummary(ctx, state, summary);
+  } catch {
+    // TLDR refinement is optional; keep the previous accepted TLDR on failure.
+  } finally {
+    if (state.activeRequest === abortController)
+      state.activeRequest = undefined;
+  }
 }
 
-/**
- * Registers pi lifecycle handlers that turn agent events into live TLDR updates.
- */
-export default function piTldr(pi: ExtensionAPI) {
-	pi.registerFlag(TLDR_MODEL_FLAG, {
-		description: "Preferred model for pi-tldr summaries, in provider/model-id format",
-		type: "string",
-	});
+export function piTldr(pi: ExtensionAPI): void {
+  pi.registerFlag(TLDR_MODEL_FLAG, {
+    description:
+      "Preferred model for pi-tldr summaries, in provider/model-id format",
+    type: "string",
+  });
 
-	// State is deliberately explicit and local to this installed extension instance.
-	// Read the handlers below as the lifecycle: session setup, request start,
-	// streaming/tool updates, then final assistant completion.
-	const state = createInitialState();
+  const state = createInitialState();
 
-	pi.registerCommand("tldr-model", {
-		description: "Choose the model used for pi-tldr summaries",
-		handler: async (args, ctx) => {
-			let value = args.trim();
-			if (!value) {
-				if (!ctx.hasUI) {
-					ctx.ui.notify("Use /tldr-model provider/model-id, /tldr-model auto, or /tldr-model reset", "error");
-					return;
-				}
+  pi.registerCommand("tldr-model", {
+    description: "Choose the model used for pi-tldr summaries",
+    handler: async (args, ctx) => {
+      let value = args.trim();
+      if (!value) {
+        if (!ctx.hasUI) return;
 
-				const choice = await selectTldrModel(ctx, state);
-				if (!choice) return;
-				value = choice;
-			}
+        const choice = await selectTldrModel(ctx, state);
+        if (!choice) return;
+        value = choice;
+      }
 
-			if (value === AUTOMATIC_MODEL_CHOICE || value === "reset") {
-				state.preferredModel = undefined;
-				state.lastFacts = "";
-				requestRefinement(ctx, state, "now");
-				ctx.ui.notify(
-					clearPreferredModel()
-						? "pi-tldr model set to auto"
-						: "pi-tldr model set to auto, but the saved preference could not be removed",
-					"info",
-				);
-				return;
-			}
+      if (value === AUTOMATIC_MODEL_CHOICE || value === "reset") {
+        state.preferredModel = undefined;
+        state.lastFacts = "";
+        requestRefinement(ctx, state, Urgency.Now);
+        const result = clearPreferredModel();
+        notifyUser(
+          ctx,
+          result.ok
+            ? "pi-tldr model set to auto"
+            : `pi-tldr model set to auto, but ${result.message}`,
+          "info",
+        );
+        return;
+      }
 
-			const nextModel = parseSupportedModelSpec(value);
-			if (!nextModel) {
-				ctx.ui.notify(`Use one of the supported pi-tldr models: ${supportedModelList()}`, "error");
-				return;
-			}
+      const nextModel = parseSupportedModelSpec(value);
+      if (!nextModel) {
+        notifyUser(
+          ctx,
+          `Use one of the supported pi-tldr models: ${supportedModelList()}`,
+          "error",
+        );
+        return;
+      }
 
-			state.preferredModel = nextModel;
-			state.lastFacts = "";
-			requestRefinement(ctx, state, "now");
-			ctx.ui.notify(
-				savePreferredModel(nextModel)
-					? `pi-tldr model set to ${formatModelSpec(nextModel)}`
-					: `pi-tldr model set to ${formatModelSpec(nextModel)}, but the preference could not be saved`,
-				"info",
-			);
-		},
-	});
+      state.preferredModel = nextModel;
+      state.lastFacts = "";
+      requestRefinement(ctx, state, Urgency.Now);
+      const result = savePreferredModel(nextModel);
+      notifyUser(
+        ctx,
+        result.ok
+          ? `pi-tldr model set to ${formatModelSpec(nextModel)}`
+          : `pi-tldr model set to ${formatModelSpec(nextModel)}, but ${result.message}`,
+        "info",
+      );
+    },
+  });
 
-	// A new/resumed session can reuse the loaded extension, so clear old UI and
-	// invalidate any async work from a previous session generation.
-	pi.on("session_start", (_event, ctx) => {
-		state.generation++;
-		state.active = true;
-		state.currentSummary = "";
-		state.preferredModel = parseSupportedModelSpec(pi.getFlag(TLDR_MODEL_FLAG)) ?? loadPreferredModel();
-		clearWidget(ctx);
-	});
+  pi.on("session_start", (event, ctx) => {
+    void event;
+    state.generation++;
+    state.active = true;
+    clearPendingWork(state);
+    resetFacts(state);
+    state.currentSummary = "";
+    state.lastFacts = "";
+    state.toolIntentById.clear();
+    state.preferredModel =
+      parseModelFlag(pi.getFlag(TLDR_MODEL_FLAG)) ?? loadPreferredModel();
+    clearWidget(ctx);
+  });
 
-	// Shutdown is the hard boundary: stop timers/requests and discard collected
-	// facts so no stale TLDR can appear after the session is gone.
-	pi.on("session_shutdown", () => {
-		state.active = false;
-		state.generation++;
-		clearPendingWork(state);
-		resetFacts(state);
-		state.toolArgsById.clear();
-	});
+  pi.on("session_shutdown", () => {
+    state.active = false;
+    state.generation++;
+    clearPendingWork(state);
+    resetFacts(state);
+    state.toolIntentById.clear();
+  });
 
-	// Each user prompt starts a new request generation. The old TLDR is cleared
-	// immediately; the first new TLDR is generated from the prompt facts.
-	pi.on("before_agent_start", (event, ctx) => {
-		state.generation++;
-		clearPendingWork(state);
-		resetFacts(state, event.prompt);
-		state.currentSummary = "";
-		state.lastFacts = "";
-		state.toolArgsById.clear();
-		clearWidget(ctx);
-		requestRefinement(ctx, state, "now");
-	});
+  pi.on("before_agent_start", (event, ctx) => {
+    state.generation++;
+    clearPendingWork(state);
+    resetFacts(state, event.prompt);
+    state.currentSummary = "";
+    state.lastFacts = "";
+    state.toolIntentById.clear();
+    clearWidget(ctx);
+    requestRefinement(ctx, state, Urgency.Now);
+  });
 
-	// Streaming assistant text can reveal the current phase before a tool call or
-	// final answer completes, so it is added as debounced context.
-	pi.on("message_update", (event, ctx) => {
-		const assistantText = extractAssistantText(asRecord(event.message));
-		if (!assistantText) return;
+  pi.on("message_update", (event, ctx) => {
+    if (!isAssistantMessage(event.message)) return;
 
-		addFact(state, "message_update", { assistantText });
-		requestRefinement(ctx, state, "debounced");
-	});
+    const assistantText = extractTextContent(event.message.content);
+    if (!assistantText) return;
 
-	// Tool start gives the TLDR model intent: what operation was requested. Args
-	// are also saved by id so completion can include both args and result.
-	pi.on("tool_execution_start", (event, ctx) => {
-		state.toolArgsById.set(event.toolCallId, event.args);
-		addFact(state, "tool_execution_start", {
-			toolName: event.toolName,
-			args: compactEventFacts(event.args),
-		});
-		requestRefinement(ctx, state, "now");
-	});
+    addFact(state, { kind: FactKind.MessageUpdate, assistantText });
+    requestRefinement(ctx, state, Urgency.Debounced);
+  });
 
-	// Tool end gives the TLDR model outcome: whether it failed and what came back.
-	// Result is placed before repeated args in the fact so budget pressure keeps it.
-	pi.on("tool_execution_end", (event, ctx) => {
-		const args = state.toolArgsById.get(event.toolCallId);
-		state.toolArgsById.delete(event.toolCallId);
-		addFact(state, "tool_execution_end", {
-			toolName: event.toolName,
-			isError: String(event.isError),
-			result: compactEventFacts(event.result),
-			args: compactEventFacts(args),
-		});
-		requestRefinement(ctx, state, "now");
-	});
+  pi.on("tool_call", (event, ctx) => {
+    const intent = createToolIntent(event);
+    state.toolIntentById.set(event.toolCallId, intent);
+    addFact(state, { kind: FactKind.ToolStart, intent });
+    requestRefinement(ctx, state, Urgency.Now);
+  });
 
-	// Assistant message end is either an intermediate tool-use stop or the final
-	// answer/error. Only final-ish states become result TLDR facts.
-	pi.on("message_end", (event, ctx) => {
-		const message = asRecord(event.message);
-		if (message?.role !== "assistant") return;
+  pi.on("tool_result", (event, ctx) => {
+    const intent = state.toolIntentById.get(event.toolCallId);
+    state.toolIntentById.delete(event.toolCallId);
+    addFact(state, {
+      kind: FactKind.ToolEnd,
+      toolName: event.toolName,
+      isError: event.isError,
+      resultText: extractToolResultText(event),
+      intent,
+    });
+    requestRefinement(ctx, state, Urgency.Now);
+  });
 
-		const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
-		if (stopReason === "toolUse") return;
+  pi.on("message_end", (event, ctx) => {
+    if (!isAssistantMessage(event.message)) return;
 
-		if (stopReason === "error" || stopReason === "aborted" || stopReason === "length") {
-			state.activity.length = 0;
-			addFact(state, "message_end", {
-				stopReason,
-				errorMessage: typeof message.errorMessage === "string" ? message.errorMessage : undefined,
-			});
-			requestRefinement(ctx, state, "now");
-			return;
-		}
+    const stopReason = completedStopReason(event.message.stopReason);
+    if (!stopReason) return;
 
-		const assistantText = extractAssistantText(message);
-		if (assistantText && stopReason === "stop") {
-			state.activity.length = 0;
-			addFact(state, "message_end", {
-				stopReason,
-				finalResultContext: truncateText(assistantText, 1_200),
-			});
-			requestRefinement(ctx, state, "now");
-		}
-	});
+    if (
+      stopReason === CompletedStopReason.Error ||
+      stopReason === CompletedStopReason.Aborted ||
+      stopReason === CompletedStopReason.Length
+    ) {
+      state.activity.splice(0);
+      addFact(state, {
+        kind: FactKind.MessageEnd,
+        stopReason,
+        errorMessage: event.message.errorMessage,
+      });
+      requestRefinement(ctx, state, Urgency.Now);
+      return;
+    }
+
+    if (stopReason === CompletedStopReason.Stop) {
+      const assistantText = extractTextContent(event.message.content);
+      if (!assistantText) {
+        state.currentSummary = "";
+        clearWidget(ctx);
+      }
+      state.activity.splice(0);
+      addFact(state, {
+        kind: FactKind.MessageEnd,
+        stopReason,
+        finalResultContext: assistantText
+          ? truncateText(assistantText, FINAL_RESULT_CONTEXT_CHARS)
+          : undefined,
+      });
+      requestRefinement(ctx, state, Urgency.Now);
+    }
+  });
 }
+
+export default piTldr;

@@ -21,6 +21,8 @@
   ],
   "scripts": {
     "check": "tsc --noEmit",
+    "format": "prettier --write README.md package.json src/index.ts",
+    "format:check": "prettier --check README.md package.json src/index.ts",
     "pack:dry-run": "npm pack --dry-run"
   },
   "pi": {
@@ -29,14 +31,17 @@
     ]
   },
   "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"
   },
   "devDependencies": {
+    "@mariozechner/pi-agent-core": "^0.72.0",
     "@mariozechner/pi-ai": "^0.72.0",
     "@mariozechner/pi-coding-agent": "^0.72.0",
     "@mariozechner/pi-tui": "^0.72.0",
+    "prettier": "^3.5.3",
     "typescript": "^5.7.3"
   },
   "engines": {
