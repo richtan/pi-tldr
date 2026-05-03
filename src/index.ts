@@ -12,7 +12,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, extname, isAbsolute, join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import {
   type Api,
@@ -60,12 +60,6 @@ const SUMMARY_FORMAT_PATTERN =
   /^['"`]|['"`]$|```|\[[^\]]+]\([^)]*\)|^\s*[-*+]\s+|^\s*#{1,6}\s+|<[^>]+>/;
 const STRUCTURED_TOKEN_PATTERN = /[{}[\]":,]/;
 const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]/g;
-const PRIVATE_KEY_PATTERN =
-  /-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/g;
-const TOKEN_PATTERN =
-  /\b(?:sk-[A-Za-z0-9_-]{20,}|(?:ghp|gho|github_pat|xox[baprs])_[A-Za-z0-9_-]+|xox[baprs]-[A-Za-z0-9-]+)\b/g;
-const SECRET_ASSIGNMENT_PATTERN =
-  /\b(password|passwd|pwd|secret|token|api[_-]?key)\s*[=:]\s*\S+/gi;
 
 interface ModelCandidate {
   readonly provider: string;
@@ -91,7 +85,7 @@ interface RuntimeState {
   pendingRequest?: RefinementRequest;
   updateTimer?: ReturnType<typeof setTimeout>;
   activeRequest?: AbortController;
-  readonly toolIntentById: Map<string, ToolIntent>;
+  readonly toolFactById: Map<string, string>;
 }
 
 interface RefinementRequest {
@@ -100,151 +94,18 @@ interface RefinementRequest {
   readonly refinementGeneration: number;
 }
 
-interface PreferenceOperationResult {
-  readonly ok: boolean;
-  readonly message?: string;
+type PreferenceOperationResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly message: string };
+
+interface PreferredModelConfig {
+  readonly model?: string;
 }
-
-type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | JsonObject
-  | readonly JsonValue[];
-
-interface JsonObject {
-  readonly [key: string]: JsonValue | undefined;
-}
-
-interface BaseFact {
-  readonly kind: FactKind;
-}
-
-interface MessageUpdateFact extends BaseFact {
-  readonly kind: FactKind.MessageUpdate;
-  readonly assistantText: string;
-}
-
-interface ToolStartFact extends BaseFact {
-  readonly kind: FactKind.ToolStart;
-  readonly intent: ToolIntent;
-}
-
-interface ToolEndFact extends BaseFact {
-  readonly kind: FactKind.ToolEnd;
-  readonly toolName: string;
-  readonly isError: boolean;
-  readonly resultText?: string;
-  readonly intent?: ToolIntent;
-}
-
-interface MessageEndFact extends BaseFact {
-  readonly kind: FactKind.MessageEnd;
-  readonly stopReason: CompletedStopReason;
-  readonly errorMessage?: string;
-  readonly finalResultContext?: string;
-}
-
-type TldrFact =
-  | MessageUpdateFact
-  | ToolStartFact
-  | ToolEndFact
-  | MessageEndFact;
 
 type AssistantContent = AssistantMessage["content"][number];
 type TextSourceContent = AssistantContent | TextContent | ImageContent;
 
-type ToolIntent =
-  | BashIntent
-  | ReadIntent
-  | GrepIntent
-  | FindIntent
-  | LsIntent
-  | EditIntent
-  | WriteIntent
-  | CustomIntent;
-
-interface BaseToolIntent {
-  readonly kind: ToolKind;
-  readonly toolCallId: string;
-}
-
-interface BashIntent extends BaseToolIntent {
-  readonly kind: ToolKind.Bash;
-  readonly command: string;
-}
-
-interface ReadIntent extends BaseToolIntent {
-  readonly kind: ToolKind.Read;
-  readonly path: string;
-  readonly offset?: number;
-  readonly limit?: number;
-}
-
-interface GrepIntent extends BaseToolIntent {
-  readonly kind: ToolKind.Grep;
-  readonly pattern: string;
-  readonly path?: string;
-  readonly glob?: string;
-}
-
-interface FindIntent extends BaseToolIntent {
-  readonly kind: ToolKind.Find;
-  readonly pattern: string;
-  readonly path?: string;
-}
-
-interface LsIntent extends BaseToolIntent {
-  readonly kind: ToolKind.Ls;
-  readonly path?: string;
-}
-
-interface EditIntent extends BaseToolIntent {
-  readonly kind: ToolKind.Edit;
-  readonly path: string;
-  readonly editCount: number;
-}
-
-interface WriteIntent extends BaseToolIntent {
-  readonly kind: ToolKind.Write;
-  readonly path: string;
-}
-
-interface CustomIntent extends BaseToolIntent {
-  readonly kind: ToolKind.Custom;
-  readonly toolName: string;
-}
-
-enum CompletedStopReason {
-  Stop = "stop",
-  Length = "length",
-  Error = "error",
-  Aborted = "aborted",
-}
-
-enum FactKind {
-  MessageUpdate = "message_update",
-  ToolStart = "tool_start",
-  ToolEnd = "tool_end",
-  MessageEnd = "message_end",
-}
-
-enum ToolKind {
-  Bash = "bash",
-  Read = "read",
-  Grep = "grep",
-  Find = "find",
-  Ls = "ls",
-  Edit = "edit",
-  Write = "write",
-  Custom = "custom",
-}
-
-enum Urgency {
-  Debounced = "debounced",
-  Now = "now",
-}
+type Urgency = "debounced" | "now";
 
 type ModelSelectorRegistry = ConstructorParameters<
   typeof ModelSelectorComponent
@@ -255,19 +116,6 @@ const FAST_MODEL_CANDIDATES: readonly ModelCandidate[] = [
   { provider: "anthropic", id: "claude-haiku-4-5-20251001" },
   { provider: "openai-codex", id: "gpt-5.4-mini" },
   { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
-  { provider: "openai-codex", id: "gpt-5.2" },
-  { provider: "openai-codex", id: "gpt-5.3-codex" },
-  { provider: "openai-codex", id: "gpt-5.4" },
-  { provider: "openai-codex", id: "gpt-5.5" },
-  { provider: "anthropic", id: "claude-sonnet-4-5" },
-  { provider: "anthropic", id: "claude-sonnet-4-5-20250929" },
-  { provider: "anthropic", id: "claude-sonnet-4-6" },
-  { provider: "anthropic", id: "claude-opus-4-1" },
-  { provider: "anthropic", id: "claude-opus-4-1-20250805" },
-  { provider: "anthropic", id: "claude-opus-4-5" },
-  { provider: "anthropic", id: "claude-opus-4-5-20251101" },
-  { provider: "anthropic", id: "claude-opus-4-6" },
-  { provider: "anthropic", id: "claude-opus-4-7" },
 ];
 
 const AUTOMATIC_TLDR_MODEL: Model<Api> = {
@@ -352,7 +200,7 @@ function createInitialState(): RuntimeState {
     currentSummary: "",
     lastFacts: "",
     lastLlmStart: 0,
-    toolIntentById: new Map(),
+    toolFactById: new Map(),
   };
 }
 
@@ -393,29 +241,8 @@ function stripAnsi(text: string): string {
   return text.replace(ANSI_PATTERN, "");
 }
 
-function redactSensitiveText(text: string): string {
-  return text
-    .replace(PRIVATE_KEY_PATTERN, "[REDACTED_PRIVATE_KEY]")
-    .replace(TOKEN_PATTERN, "[REDACTED_TOKEN]")
-    .replace(SECRET_ASSIGNMENT_PATTERN, "$1=[REDACTED_SECRET]");
-}
-
-function sanitizeModelText(text: string): string {
-  return redactSensitiveText(stripAnsi(text));
-}
-
 function factField(name: string, value: string, maxChars?: number): string {
-  return `${name}=${truncateText(sanitizeModelText(value), maxChars)}`;
-}
-
-function pathDescriptor(path: string): string {
-  const extension = extname(path);
-  const kind = isAbsolute(path) ? "absolute" : "relative";
-  return extension ? `${kind} ${extension.slice(1)} file` : `${kind} path`;
-}
-
-function isJsonObject(value: JsonValue): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return `${name}=${truncateText(stripAnsi(value), maxChars)}`;
 }
 
 function isAssistantMessage(
@@ -437,27 +264,6 @@ function extractTextContent(
     .join("\n")
     .trim();
   return text || undefined;
-}
-
-function extractToolResultText(event: ToolResultEvent): string | undefined {
-  return extractTextContent(event.content);
-}
-
-function completedStopReason(
-  stopReason: AssistantMessage["stopReason"],
-): CompletedStopReason | undefined {
-  switch (stopReason) {
-    case CompletedStopReason.Stop:
-      return CompletedStopReason.Stop;
-    case CompletedStopReason.Length:
-      return CompletedStopReason.Length;
-    case CompletedStopReason.Error:
-      return CompletedStopReason.Error;
-    case CompletedStopReason.Aborted:
-      return CompletedStopReason.Aborted;
-    default:
-      return undefined;
-  }
 }
 
 function formatModelSpec({ provider, id }: ModelCandidate): string {
@@ -518,10 +324,8 @@ function tldrConfigPath(): string {
 
 function parsePreferredModelConfig(configText: string): string | undefined {
   try {
-    const value = JSON.parse(configText) as JsonValue;
-    return isJsonObject(value) && typeof value.model === "string"
-      ? value.model
-      : undefined;
+    const value = JSON.parse(configText) as PreferredModelConfig | null;
+    return value && typeof value.model === "string" ? value.model : undefined;
   } catch {
     return undefined;
   }
@@ -636,181 +440,142 @@ async function selectTldrModel(
     : formatRegistryModel(selectedModel);
 }
 
-function createToolIntent(event: ToolCallEvent): ToolIntent {
+function toolCallFact(event: ToolCallEvent): string {
   if (isToolCallEventType("bash", event)) {
-    return {
-      kind: ToolKind.Bash,
-      toolCallId: event.toolCallId,
-      command: event.input.command,
-    };
+    return [
+      "event=tool_start",
+      "tool=bash",
+      factField("command", event.input.command, 240),
+    ].join("\n");
   }
   if (isToolCallEventType("read", event)) {
     const { path, offset, limit } = event.input;
-    return {
-      kind: ToolKind.Read,
-      toolCallId: event.toolCallId,
-      path,
-      offset,
-      limit,
-    };
+    return [
+      "event=tool_start",
+      "tool=read",
+      factField("path", path, 240),
+      offset === undefined ? undefined : `offset=${String(offset)}`,
+      limit === undefined ? undefined : `limit=${String(limit)}`,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
   }
   if (isToolCallEventType("grep", event)) {
     const { pattern, path, glob } = event.input;
-    return {
-      kind: ToolKind.Grep,
-      toolCallId: event.toolCallId,
-      pattern,
-      path,
-      glob,
-    };
+    return [
+      "event=tool_start",
+      "tool=grep",
+      factField("pattern", pattern, 160),
+      path ? factField("path", path, 240) : undefined,
+      glob ? factField("glob", glob) : undefined,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
   }
   if (isToolCallEventType("find", event)) {
     const { pattern, path } = event.input;
-    return { kind: ToolKind.Find, toolCallId: event.toolCallId, pattern, path };
+    return [
+      "event=tool_start",
+      "tool=find",
+      factField("pattern", pattern, 160),
+      path ? factField("path", path, 240) : undefined,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
   }
   if (isToolCallEventType("ls", event)) {
-    return {
-      kind: ToolKind.Ls,
-      toolCallId: event.toolCallId,
-      path: event.input.path,
-    };
+    return [
+      "event=tool_start",
+      "tool=ls",
+      event.input.path ? factField("path", event.input.path, 240) : undefined,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
   }
   if (isToolCallEventType("edit", event)) {
-    return {
-      kind: ToolKind.Edit,
-      toolCallId: event.toolCallId,
-      path: event.input.path,
-      editCount: event.input.edits.length,
-    };
+    return [
+      "event=tool_start",
+      "tool=edit",
+      factField("path", event.input.path, 240),
+      `editCount=${String(event.input.edits.length)}`,
+    ].join("\n");
   }
   if (isToolCallEventType("write", event)) {
-    return {
-      kind: ToolKind.Write,
-      toolCallId: event.toolCallId,
-      path: event.input.path,
-    };
+    return [
+      "event=tool_start",
+      "tool=write",
+      factField("path", event.input.path, 240),
+    ].join("\n");
   }
-  return {
-    kind: ToolKind.Custom,
-    toolCallId: event.toolCallId,
-    toolName: event.toolName,
-  };
+  return [
+    "event=tool_start",
+    "tool=custom",
+    factField("toolName", event.toolName),
+  ].join("\n");
 }
 
-function toolIntentLines(intent: ToolIntent): string[] {
-  switch (intent.kind) {
-    case ToolKind.Bash:
-      return ["tool=bash", factField("command", intent.command, 240)];
-    case ToolKind.Read:
-      return [
-        "tool=read",
-        factField("path", pathDescriptor(intent.path)),
-        intent.offset === undefined
-          ? undefined
-          : `offset=${String(intent.offset)}`,
-        intent.limit === undefined
-          ? undefined
-          : `limit=${String(intent.limit)}`,
-      ].filter((line): line is string => line !== undefined);
-    case ToolKind.Grep:
-      return [
-        "tool=grep",
-        factField("pattern", intent.pattern, 160),
-        intent.path
-          ? factField("path", pathDescriptor(intent.path))
-          : undefined,
-        intent.glob ? factField("glob", intent.glob) : undefined,
-      ].filter((line): line is string => line !== undefined);
-    case ToolKind.Find:
-      return [
-        "tool=find",
-        factField("pattern", intent.pattern, 160),
-        intent.path
-          ? factField("path", pathDescriptor(intent.path))
-          : undefined,
-      ].filter((line): line is string => line !== undefined);
-    case ToolKind.Ls:
-      return [
-        "tool=ls",
-        intent.path
-          ? factField("path", pathDescriptor(intent.path))
-          : undefined,
-      ].filter((line): line is string => line !== undefined);
-    case ToolKind.Edit:
-      return [
-        "tool=edit",
-        factField("path", pathDescriptor(intent.path)),
-        `editCount=${String(intent.editCount)}`,
-      ];
-    case ToolKind.Write:
-      return ["tool=write", factField("path", pathDescriptor(intent.path))];
-    case ToolKind.Custom:
-      return ["tool=custom", factField("toolName", intent.toolName)];
-    default:
-      return assertNever(intent);
-  }
+function toolResultFact(
+  event: ToolResultEvent,
+  toolStartFact?: string,
+): string {
+  const resultText = extractTextContent(event.content);
+  return [
+    "event=tool_end",
+    toolStartFact?.replace("event=tool_start\n", ""),
+    factField("toolName", event.toolName),
+    `isError=${String(event.isError)}`,
+    resultText ? factField("result", resultText, MAX_FACT_CHARS) : undefined,
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n");
 }
 
-function formatFact(fact: TldrFact): string {
-  switch (fact.kind) {
-    case FactKind.MessageUpdate:
-      return [
-        "event=message_update",
-        factField("assistantText", fact.assistantText),
-      ].join("\n");
-    case FactKind.ToolStart:
-      return ["event=tool_start", ...toolIntentLines(fact.intent)].join("\n");
-    case FactKind.ToolEnd:
-      return [
-        "event=tool_end",
-        fact.intent ? undefined : factField("toolName", fact.toolName),
-        `isError=${String(fact.isError)}`,
-        fact.resultText
-          ? factField("result", fact.resultText, MAX_FACT_CHARS)
-          : undefined,
-        ...(fact.intent ? toolIntentLines(fact.intent) : []),
-      ]
-        .filter((line): line is string => line !== undefined)
-        .join("\n");
-    case FactKind.MessageEnd:
+function finalFact(message: AssistantMessage): string | undefined {
+  switch (message.stopReason) {
+    case "toolUse":
+      return undefined;
+    case "error":
+    case "aborted":
+    case "length":
       return [
         "event=message_end",
-        `stopReason=${fact.stopReason}`,
-        fact.errorMessage
-          ? factField("errorMessage", fact.errorMessage)
-          : undefined,
-        fact.finalResultContext
-          ? factField("finalResultContext", fact.finalResultContext)
+        `stopReason=${message.stopReason}`,
+        message.errorMessage
+          ? factField("errorMessage", message.errorMessage)
           : undefined,
       ]
         .filter((line): line is string => line !== undefined)
         .join("\n");
+    case "stop": {
+      const finalText = extractTextContent(message.content);
+      return [
+        "event=message_end",
+        "stopReason=stop",
+        finalText
+          ? factField(
+              "finalResultContext",
+              finalText,
+              FINAL_RESULT_CONTEXT_CHARS,
+            )
+          : undefined,
+      ]
+        .filter((line): line is string => line !== undefined)
+        .join("\n");
+    }
     default:
-      return assertNever(fact);
+      return undefined;
   }
-}
-
-function assertNever(value: never): never {
-  throw new Error(`Unhandled TLDR variant: ${String(value)}`);
 }
 
 function resetFacts(state: RuntimeState, prompt?: string): void {
-  state.prompt = truncateText(
-    sanitizeModelText(prompt ?? ""),
-    MAX_PROMPT_CHARS,
-  );
+  state.prompt = truncateText(stripAnsi(prompt ?? ""), MAX_PROMPT_CHARS);
   state.activity.splice(0);
 }
 
-function addFact(state: RuntimeState, fact: TldrFact): void {
-  const formattedFact = formatFact(fact);
-  if (
-    !formattedFact ||
-    state.activity[state.activity.length - 1] === formattedFact
-  )
-    return;
+function addFact(state: RuntimeState, fact: string): void {
+  if (!fact || state.activity[state.activity.length - 1] === fact) return;
 
-  state.activity.push(formattedFact);
+  state.activity.push(fact);
   if (state.activity.length > MAX_ACTIVITY_HISTORY) {
     state.activity.splice(0, state.activity.length - MAX_ACTIVITY_HISTORY);
   }
@@ -908,7 +673,6 @@ function createCompletionOptions(
     signal,
   };
 
-  if (auth.model.provider !== "openai-codex") options.temperature = 0.2;
   return options;
 }
 
@@ -963,7 +727,7 @@ function requestRefinement(
   if (state.updateTimer) clearTimeout(state.updateTimer);
   const elapsedSinceLastLlm = Date.now() - state.lastLlmStart;
   const delay =
-    urgency === Urgency.Now
+    urgency === "now"
       ? 0
       : Math.max(0, LLM_UPDATE_INTERVAL_MS - elapsedSinceLastLlm);
   state.updateTimer = setTimeout(() => flushRefinement(ctx, state), delay);
@@ -1050,7 +814,7 @@ export function piTldr(pi: ExtensionAPI): void {
       if (value === AUTOMATIC_MODEL_CHOICE || value === "reset") {
         state.preferredModel = undefined;
         state.lastFacts = "";
-        requestRefinement(ctx, state, Urgency.Now);
+        requestRefinement(ctx, state, "now");
         const result = clearPreferredModel();
         notifyUser(
           ctx,
@@ -1074,7 +838,7 @@ export function piTldr(pi: ExtensionAPI): void {
 
       state.preferredModel = nextModel;
       state.lastFacts = "";
-      requestRefinement(ctx, state, Urgency.Now);
+      requestRefinement(ctx, state, "now");
       const result = savePreferredModel(nextModel);
       notifyUser(
         ctx,
@@ -1094,7 +858,7 @@ export function piTldr(pi: ExtensionAPI): void {
     resetFacts(state);
     state.currentSummary = "";
     state.lastFacts = "";
-    state.toolIntentById.clear();
+    state.toolFactById.clear();
     state.preferredModel =
       parseModelFlag(pi.getFlag(TLDR_MODEL_FLAG)) ?? loadPreferredModel();
     clearWidget(ctx);
@@ -1105,7 +869,7 @@ export function piTldr(pi: ExtensionAPI): void {
     state.generation++;
     clearPendingWork(state);
     resetFacts(state);
-    state.toolIntentById.clear();
+    state.toolFactById.clear();
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -1114,9 +878,9 @@ export function piTldr(pi: ExtensionAPI): void {
     resetFacts(state, event.prompt);
     state.currentSummary = "";
     state.lastFacts = "";
-    state.toolIntentById.clear();
+    state.toolFactById.clear();
     clearWidget(ctx);
-    requestRefinement(ctx, state, Urgency.Now);
+    requestRefinement(ctx, state, "now");
   });
 
   pi.on("message_update", (event, ctx) => {
@@ -1125,67 +889,45 @@ export function piTldr(pi: ExtensionAPI): void {
     const assistantText = extractTextContent(event.message.content);
     if (!assistantText) return;
 
-    addFact(state, { kind: FactKind.MessageUpdate, assistantText });
-    requestRefinement(ctx, state, Urgency.Debounced);
+    addFact(
+      state,
+      ["event=message_update", factField("assistantText", assistantText)].join(
+        "\n",
+      ),
+    );
+    requestRefinement(ctx, state, "debounced");
   });
 
   pi.on("tool_call", (event, ctx) => {
-    const intent = createToolIntent(event);
-    state.toolIntentById.set(event.toolCallId, intent);
-    addFact(state, { kind: FactKind.ToolStart, intent });
-    requestRefinement(ctx, state, Urgency.Now);
+    const fact = toolCallFact(event);
+    state.toolFactById.set(event.toolCallId, fact);
+    addFact(state, fact);
+    requestRefinement(ctx, state, "now");
   });
 
   pi.on("tool_result", (event, ctx) => {
-    const intent = state.toolIntentById.get(event.toolCallId);
-    state.toolIntentById.delete(event.toolCallId);
-    addFact(state, {
-      kind: FactKind.ToolEnd,
-      toolName: event.toolName,
-      isError: event.isError,
-      resultText: extractToolResultText(event),
-      intent,
-    });
-    requestRefinement(ctx, state, Urgency.Now);
+    const toolStartFact = state.toolFactById.get(event.toolCallId);
+    state.toolFactById.delete(event.toolCallId);
+    addFact(state, toolResultFact(event, toolStartFact));
+    requestRefinement(ctx, state, "now");
   });
 
   pi.on("message_end", (event, ctx) => {
     if (!isAssistantMessage(event.message)) return;
 
-    const stopReason = completedStopReason(event.message.stopReason);
-    if (!stopReason) return;
+    const fact = finalFact(event.message);
+    if (!fact) return;
 
     if (
-      stopReason === CompletedStopReason.Error ||
-      stopReason === CompletedStopReason.Aborted ||
-      stopReason === CompletedStopReason.Length
+      event.message.stopReason === "stop" &&
+      !extractTextContent(event.message.content)
     ) {
-      state.activity.splice(0);
-      addFact(state, {
-        kind: FactKind.MessageEnd,
-        stopReason,
-        errorMessage: event.message.errorMessage,
-      });
-      requestRefinement(ctx, state, Urgency.Now);
-      return;
+      state.currentSummary = "";
+      clearWidget(ctx);
     }
-
-    if (stopReason === CompletedStopReason.Stop) {
-      const assistantText = extractTextContent(event.message.content);
-      if (!assistantText) {
-        state.currentSummary = "";
-        clearWidget(ctx);
-      }
-      state.activity.splice(0);
-      addFact(state, {
-        kind: FactKind.MessageEnd,
-        stopReason,
-        finalResultContext: assistantText
-          ? truncateText(assistantText, FINAL_RESULT_CONTEXT_CHARS)
-          : undefined,
-      });
-      requestRefinement(ctx, state, Urgency.Now);
-    }
+    state.activity.splice(0);
+    addFact(state, fact);
+    requestRefinement(ctx, state, "now");
   });
 }
 
