@@ -231,12 +231,20 @@ function normalizeText(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Normalizes text and optionally limits it to a character budget using an
+ * ellipsis. Used for model facts, not terminal-width wrapping.
+ */
 function truncateText(text: string, maxChars?: number): string {
 	const normalized = normalizeText(text);
 	if (maxChars === undefined) return normalized;
 	return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars - 1)}…`;
 }
 
+/**
+ * Detects obvious JSON-like output so raw structured data never becomes visible
+ * TLDR text.
+ */
 function looksLikeStructuredData(text: string): boolean {
 	const trimmed = text.trim();
 	return (
@@ -252,6 +260,10 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
 }
 
+/**
+ * Serializes unknown event payloads for model-only context. Serialization
+ * failures produce an empty fact instead of leaking an exception into handlers.
+ */
 function safeJsonPreview(value: unknown): string {
 	try {
 		return JSON.stringify(value) ?? "";
@@ -260,10 +272,18 @@ function safeJsonPreview(value: unknown): string {
 	}
 }
 
+/**
+ * Removes ANSI escape sequences before sending facts to models or rendering
+ * accepted summaries.
+ */
 function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
+/**
+ * Extracts text blocks from assistant messages while ignoring thinking blocks,
+ * tool calls, images, and malformed extension payloads.
+ */
 function extractAssistantText(message: { content?: unknown } | undefined): string | undefined {
 	if (!Array.isArray(message?.content)) return undefined;
 
@@ -287,14 +307,25 @@ function compactEventFacts(value: unknown): string {
 	return truncateText(stripAnsi(safeJsonPreview(value)), MAX_FACT_CHARS);
 }
 
+/**
+ * Formats extension model candidates as the user-facing `provider/model-id`
+ * syntax accepted by flags, commands, and saved config.
+ */
 function formatModelSpec(candidate: ModelCandidate): string {
 	return `${candidate.provider}/${candidate.id}`;
 }
 
+/**
+ * Formats registry models with the same syntax used by ModelCandidate helpers.
+ */
 function formatRegistryModel(model: Model<Api>): string {
 	return `${model.provider}/${model.id}`;
 }
 
+/**
+ * Parses a loose user/config value into a provider/model-id pair. Support-list
+ * validation is intentionally separate so callers can choose strictness.
+ */
 function parseModelSpec(value: unknown): ModelCandidate | undefined {
 	if (typeof value !== "string") return undefined;
 
@@ -308,19 +339,33 @@ function parseModelSpec(value: unknown): ModelCandidate | undefined {
 	};
 }
 
+/**
+ * Restricts TLDR model selection to models that were verified to return short,
+ * completed status summaries through pi's provider path.
+ */
 function isSupportedTldrModel(candidate: ModelCandidate): boolean {
 	return FAST_MODEL_CANDIDATES.some((supported) => formatModelSpec(supported) === formatModelSpec(candidate));
 }
 
+/**
+ * Parses and validates a user/config model value against the supported TLDR set.
+ */
 function parseSupportedModelSpec(value: unknown): ModelCandidate | undefined {
 	const candidate = parseModelSpec(value);
 	return candidate && isSupportedTldrModel(candidate) ? candidate : undefined;
 }
 
+/**
+ * Builds the comma-separated model list shown in command validation errors.
+ */
 function supportedModelList(): string {
 	return FAST_MODEL_CANDIDATES.map(formatModelSpec).join(", ");
 }
 
+/**
+ * Returns the model trial order, placing a direct user preference first while
+ * preserving automatic fallback candidates without duplicates.
+ */
 function modelCandidates(preferredModel?: ModelCandidate): ReadonlyArray<ModelCandidate> {
 	if (!preferredModel) return FAST_MODEL_CANDIDATES;
 
@@ -330,6 +375,10 @@ function modelCandidates(preferredModel?: ModelCandidate): ReadonlyArray<ModelCa
 	];
 }
 
+/**
+ * Resolves the extension-owned preference file inside pi's active agent config
+ * directory, honoring `PI_CODING_AGENT_DIR` through getAgentDir().
+ */
 function tldrConfigPath(): string {
 	return join(getAgentDir(), TLDR_MODEL_CONFIG_FILE);
 }
@@ -350,6 +399,10 @@ function loadPreferredModel(): ModelCandidate | undefined {
 	}
 }
 
+/**
+ * Persists a validated TLDR model preference. Returns false when the preference
+ * was applied for this session but could not be written globally.
+ */
 function savePreferredModel(preferredModel: ModelCandidate): boolean {
 	try {
 		const path = tldrConfigPath();
@@ -361,6 +414,10 @@ function savePreferredModel(preferredModel: ModelCandidate): boolean {
 	}
 }
 
+/**
+ * Removes the saved preference so future sessions return to automatic TLDR
+ * model selection.
+ */
 function clearPreferredModel(): boolean {
 	try {
 		const path = tldrConfigPath();
@@ -371,10 +428,17 @@ function clearPreferredModel(): boolean {
 	}
 }
 
+/**
+ * Identifies the synthetic `auto` row injected into the model selector.
+ */
 function isAutomaticModel(model: Model<Api>): boolean {
 	return model.provider === AUTOMATIC_MODEL_PROVIDER && model.id === AUTOMATIC_MODEL_CHOICE;
 }
 
+/**
+ * Wraps pi's model registry for the selector so `/tldr-model` only exposes the
+ * synthetic `auto` row plus supported TLDR models with configured auth.
+ */
 function createModelSelectorRegistry(ctx: ExtensionContext): ModelSelectorRegistry {
 	return new Proxy(ctx.modelRegistry, {
 		get(target, property, receiver) {
@@ -403,6 +467,10 @@ function createModelSelectorRegistry(ctx: ExtensionContext): ModelSelectorRegist
 	}) as ModelSelectorRegistry;
 }
 
+/**
+ * Opens pi's reusable model selector and converts the selection into the command
+ * value handled by `/tldr-model`.
+ */
 async function selectTldrModel(ctx: ExtensionContext, state: RuntimeState): Promise<string | undefined> {
 	const selectorRegistry = createModelSelectorRegistry(ctx);
 	const currentModel = state.preferredModel
@@ -528,6 +596,10 @@ async function getFastModelAuth(ctx: ExtensionContext, preferredModel?: ModelCan
 	return undefined;
 }
 
+/**
+ * Builds provider options for one TLDR completion. Codex intentionally omits
+ * temperature because ChatGPT-backed Codex Responses rejects that parameter.
+ */
 function createCompletionOptions(auth: FastModelAuth, signal: AbortSignal): ProviderStreamOptions {
 	const options: ProviderStreamOptions = {
 		apiKey: auth.apiKey,
