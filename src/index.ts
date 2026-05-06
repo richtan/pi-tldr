@@ -40,6 +40,12 @@ const LLM_UPDATE_INTERVAL_MS = 1_200;
 const TLDR_MAX_TOKENS = 80;
 const TLDR_REQUEST_TIMEOUT_MS = 8_000;
 
+type CompleteFunction = typeof complete;
+
+export interface PiTldrDependencies {
+  readonly complete: CompleteFunction;
+}
+
 interface RuntimeState {
   active: boolean;
   preferredModel?: TldrModelPreference;
@@ -52,6 +58,7 @@ interface RuntimeState {
   updateTimer?: ReturnType<typeof setTimeout>;
   activeRequest?: AbortController;
   readonly facts: TldrFactSession;
+  readonly complete: CompleteFunction;
 }
 
 interface RefinementRequest {
@@ -117,7 +124,7 @@ class PiTldrBox implements Component {
   }
 }
 
-function createInitialState(): RuntimeState {
+function createInitialState(completeTldr: CompleteFunction): RuntimeState {
   return {
     active: false,
     generation: 0,
@@ -126,6 +133,7 @@ function createInitialState(): RuntimeState {
     lastFacts: "",
     lastLlmStart: 0,
     facts: new TldrFactSession(),
+    complete: completeTldr,
   };
 }
 
@@ -269,7 +277,7 @@ async function generateSummary(
       ],
       timestamp: Date.now(),
     };
-    const response = await complete(
+    const response = await state.complete(
       auth.model,
       { systemPrompt: TLDR_SYSTEM_PROMPT, messages: [message] },
       createCompletionOptions(auth, abortController.signal),
@@ -287,93 +295,101 @@ async function generateSummary(
   }
 }
 
-export function piTldr(pi: ExtensionAPI): void {
-  pi.registerFlag(TLDR_MODEL_FLAG, {
-    description:
-      "Preferred model for pi-tldr summaries, in provider/model-id format",
-    type: "string",
-  });
+export function createPiTldr(
+  dependencies: Partial<PiTldrDependencies> = {},
+): (pi: ExtensionAPI) => void {
+  const completeTldr = dependencies.complete ?? complete;
 
-  const state = createInitialState();
+  return (pi: ExtensionAPI): void => {
+    pi.registerFlag(TLDR_MODEL_FLAG, {
+      description:
+        "Preferred model for pi-tldr summaries, in provider/model-id format",
+      type: "string",
+    });
 
-  pi.registerCommand("tldr-model", {
-    description: "Choose the model used for pi-tldr summaries",
-    handler: async (args, ctx) => {
-      let value = args.trim();
-      if (!value) {
-        if (!ctx.hasUI) return;
+    const state = createInitialState(completeTldr);
 
-        const choice = await selectTldrModel(ctx, state.preferredModel);
-        if (!choice) return;
-        value = choice;
-      }
+    pi.registerCommand("tldr-model", {
+      description: "Choose the model used for pi-tldr summaries",
+      handler: async (args, ctx) => {
+        let value = args.trim();
+        if (!value) {
+          if (!ctx.hasUI) return;
 
-      const update = applyModelPreferenceChoice(value);
-      if (!update.ok) {
-        notifyUser(ctx, update.message, "error");
+          const choice = await selectTldrModel(ctx, state.preferredModel);
+          if (!choice) return;
+          value = choice;
+        }
+
+        const update = applyModelPreferenceChoice(value);
+        if (!update.ok) {
+          notifyUser(ctx, update.message, "error");
+          return;
+        }
+
+        state.preferredModel = update.preferredModel;
+        state.lastFacts = "";
+        requestRefinement(ctx, state, "now");
+        notifyUser(ctx, update.notice, "info");
+      },
+    });
+
+    pi.on("session_start", (event, ctx) => {
+      void event;
+      state.generation++;
+      state.active = true;
+      resetRunState(state);
+      state.preferredModel = resolveInitialModelPreference(
+        pi.getFlag(TLDR_MODEL_FLAG),
+      );
+      clearWidget(ctx);
+    });
+
+    pi.on("session_shutdown", () => {
+      state.active = false;
+      state.generation++;
+      resetRunState(state);
+    });
+
+    pi.on("before_agent_start", (event, ctx) => {
+      state.generation++;
+      resetRunState(state, event.prompt);
+      clearWidget(ctx);
+      requestRefinement(ctx, state, "now");
+    });
+
+    pi.on("message_update", (event, ctx) => {
+      if (!state.facts.recordAssistantUpdate(event.message)) return;
+      requestRefinement(ctx, state, "debounced");
+    });
+
+    pi.on("tool_call", (event, ctx) => {
+      state.facts.recordToolCall(event);
+      requestRefinement(ctx, state, "now");
+    });
+
+    pi.on("tool_result", (event, ctx) => {
+      state.facts.recordToolResult(event);
+      requestRefinement(ctx, state, "now");
+    });
+
+    pi.on("message_end", (event, ctx) => {
+      const result = state.facts.recordMessageEnd(event.message);
+      if (result === "ignored") return;
+
+      if (result === "emptyFinalStop") {
+        clearPendingWork(state);
+        state.currentSummary = "";
+        state.lastFacts = "";
+        clearWidget(ctx);
         return;
       }
 
-      state.preferredModel = update.preferredModel;
-      state.lastFacts = "";
       requestRefinement(ctx, state, "now");
-      notifyUser(ctx, update.notice, "info");
-    },
-  });
-
-  pi.on("session_start", (event, ctx) => {
-    void event;
-    state.generation++;
-    state.active = true;
-    resetRunState(state);
-    state.preferredModel = resolveInitialModelPreference(
-      pi.getFlag(TLDR_MODEL_FLAG),
-    );
-    clearWidget(ctx);
-  });
-
-  pi.on("session_shutdown", () => {
-    state.active = false;
-    state.generation++;
-    resetRunState(state);
-  });
-
-  pi.on("before_agent_start", (event, ctx) => {
-    state.generation++;
-    resetRunState(state, event.prompt);
-    clearWidget(ctx);
-    requestRefinement(ctx, state, "now");
-  });
-
-  pi.on("message_update", (event, ctx) => {
-    if (!state.facts.recordAssistantUpdate(event.message)) return;
-    requestRefinement(ctx, state, "debounced");
-  });
-
-  pi.on("tool_call", (event, ctx) => {
-    state.facts.recordToolCall(event);
-    requestRefinement(ctx, state, "now");
-  });
-
-  pi.on("tool_result", (event, ctx) => {
-    state.facts.recordToolResult(event);
-    requestRefinement(ctx, state, "now");
-  });
-
-  pi.on("message_end", (event, ctx) => {
-    const result = state.facts.recordMessageEnd(event.message);
-    if (result === "ignored") return;
-
-    if (result === "emptyFinalStop") {
-      clearPendingWork(state);
-      state.currentSummary = "";
-      state.lastFacts = "";
-      clearWidget(ctx);
-      return;
-    }
-
-    requestRefinement(ctx, state, "now");
-  });
+    });
+  };
 }
+
+export const piTldr = createPiTldr();
 
 export default piTldr;

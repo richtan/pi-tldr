@@ -4,6 +4,7 @@ import {
   extractSummary,
   factField,
   formatFact,
+  normalizeText,
   stripAnsi,
   truncateText,
 } from "../src/tldr-core.js";
@@ -11,15 +12,13 @@ import {
 describe("tldr text formatting", () => {
   it("strips ANSI codes and truncates fact values at the boundary", () => {
     assert.equal(
-      factField(
-        "command",
-        "\u001b[31mANTHROPIC_API_KEY=sk-ant-example\u001b[0m",
-        24,
-      ),
-      "command=ANTHROPIC_API_KEY=sk-an…",
+      factField("command", "\u001b[31mRunning a long command\u001b[0m", 20),
+      "command=Running a long comm…",
     );
     assert.equal(stripAnsi("\u001b[32mok\u001b[0m"), "ok");
     assert.equal(truncateText("abcdef", 4), "abc…");
+    assert.equal(truncateText("abcdef", 0), "");
+    assert.equal(normalizeText("  one\n\t two   "), "one two");
   });
 });
 
@@ -46,6 +45,11 @@ describe("summary extraction", () => {
 
   it("rejects markdown, structured data, multi-line output, and overlong text", () => {
     assert.equal(extractSummary("- Inspecting files", 180), undefined);
+    assert.equal(
+      extractSummary("[Inspecting](https://example.test)", 180),
+      undefined,
+    );
+    assert.equal(extractSummary("<status>Inspecting</status>", 180), undefined);
     assert.equal(extractSummary('{"status":"running"}', 180), undefined);
     assert.equal(extractSummary("Line one\nLine two", 180), undefined);
     assert.equal(extractSummary("a".repeat(181), 180), undefined);
