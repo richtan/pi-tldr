@@ -5,6 +5,10 @@
   "type": "module",
   "license": "MIT",
   "author": "Richie Tan",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/richtan/pi-tldr"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
