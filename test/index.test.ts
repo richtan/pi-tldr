@@ -11,6 +11,26 @@ import type {
   ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
 import { createPiTldr, piTldr } from "../src/index.js";
+import type { PreferredModelStore } from "../src/tldr-models.js";
+
+type EventHandler = (
+  event: Record<string, unknown>,
+  ctx: ExtensionContext,
+) => void;
+type CommandHandler = (
+  args: string,
+  ctx: ExtensionContext,
+) => Promise<void> | void;
+
+interface RegisteredCommand {
+  readonly handler: CommandHandler;
+}
+
+interface FakePiHarness {
+  readonly pi: ExtensionAPI;
+  readonly commands: Map<string, RegisteredCommand>;
+  readonly events: Map<string, EventHandler>;
+}
 
 function createFakeModel(
   provider = "anthropic",
@@ -47,12 +67,88 @@ function createAssistantResponse(text: string): AssistantMessage {
   } as AssistantMessage;
 }
 
+function createMemoryPreferredModelStore(): PreferredModelStore {
+  let savedModel: string | undefined;
+  return {
+    load() {
+      return savedModel;
+    },
+    save(modelSpec) {
+      savedModel = modelSpec;
+      return undefined;
+    },
+    clear() {
+      savedModel = undefined;
+      return undefined;
+    },
+  };
+}
+
+function createFakePiHarness(): FakePiHarness {
+  const commands = new Map<string, RegisteredCommand>();
+  const events = new Map<string, EventHandler>();
+  const pi = {
+    registerFlag() {},
+    registerCommand(name: string, command: RegisteredCommand) {
+      commands.set(name, command);
+    },
+    on(name: string, handler: EventHandler) {
+      events.set(name, handler);
+    },
+    getFlag() {
+      return undefined;
+    },
+  } as unknown as ExtensionAPI;
+
+  return { pi, commands, events };
+}
+
+type FakeAuthResult = { readonly ok: boolean; readonly apiKey?: string };
+type FakeAuthProvider = (
+  model: Model<Api>,
+) => Promise<FakeAuthResult> | FakeAuthResult;
+
+function createFakeContext(options: {
+  readonly model?: Model<Api>;
+  readonly models?: readonly Model<Api>[];
+  readonly auth?: FakeAuthResult | FakeAuthProvider;
+  readonly widgets?: unknown[];
+  readonly notifications?: Array<{
+    readonly message: string;
+    readonly level: string;
+  }>;
+}): ExtensionContext {
+  const models = options.models ?? [options.model ?? createFakeModel()];
+  return {
+    hasUI: true,
+    ui: {
+      setWidget(_key: string, widget: unknown) {
+        options.widgets?.push(widget);
+      },
+      notify(message: string, level: string) {
+        options.notifications?.push({ message, level });
+      },
+    },
+    modelRegistry: {
+      find(provider: string, id: string) {
+        return models.find(
+          (model) => provider === model.provider && id === model.id,
+        );
+      },
+      async getApiKeyAndHeaders(model: Model<Api>) {
+        if (typeof options.auth === "function") return options.auth(model);
+        return options.auth ?? { ok: true, apiKey: "test-key" };
+      },
+    },
+  } as unknown as ExtensionContext;
+}
+
 function waitForTimers(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 5));
 }
 
 describe("piTldr extension entrypoint", () => {
-  it("registers the flag, command, and lifecycle event handlers", () => {
+  it("registers the flags, commands, and lifecycle event handlers", () => {
     const flags: string[] = [];
     const commands: string[] = [];
     const events: string[] = [];
@@ -71,7 +167,7 @@ describe("piTldr extension entrypoint", () => {
     piTldr(pi);
 
     assert.deepEqual(flags, ["tldr-model"]);
-    assert.deepEqual(commands, ["tldr-model"]);
+    assert.deepEqual(commands, ["tldr"]);
     assert.deepEqual(events, [
       "session_start",
       "session_shutdown",
@@ -83,52 +179,257 @@ describe("piTldr extension entrypoint", () => {
     ]);
   });
 
+  it("toggles pi-tldr off for the current session", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({ notifications });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("off", ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      [
+        "pi-tldr status",
+        "enabled: no",
+        "selected model: auto",
+        "active model: none",
+      ].join("\n"),
+    );
+  });
+
+  it("shows available commands for bare /tldr", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({ notifications });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("", ctx);
+
+    assert.deepEqual(notifications, [
+      {
+        level: "info",
+        message: [
+          "pi-tldr commands",
+          "/tldr help - show this help",
+          "/tldr status - show enabled and model status",
+          "/tldr on - enable TLDRs for this session",
+          "/tldr off - disable TLDRs for this session",
+          "/tldr toggle - toggle TLDRs for this session",
+          "/tldr model - choose the TLDR model",
+          "/tldr model <model|auto|reset> - set the TLDR model",
+        ].join("\n"),
+      },
+    ]);
+  });
+
+  it("reports enabled status, selected model, and active auto model", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({ notifications });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+
+    assert.deepEqual(notifications, [
+      {
+        level: "info",
+        message: [
+          "pi-tldr status",
+          "enabled: yes",
+          "selected model: auto",
+          "active model: anthropic/claude-haiku-4-5",
+        ].join("\n"),
+      },
+    ]);
+  });
+
+  it("reports when auto has no active model", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({
+      auth: { ok: false },
+      notifications,
+    });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      [
+        "pi-tldr status",
+        "enabled: yes",
+        "selected model: auto",
+        "active model: none",
+      ].join("\n"),
+    );
+  });
+
+  it("reports directly selected models as selected and active", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({
+      model: createFakeModel("openai-codex", "gpt-5.4-mini"),
+      notifications,
+    });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("model openai-codex/gpt-5.4-mini", ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      [
+        "pi-tldr status",
+        "enabled: yes",
+        "selected model: openai-codex/gpt-5.4-mini",
+        "active model: openai-codex/gpt-5.4-mini",
+      ].join("\n"),
+    );
+  });
+
+  it("reports active fallback when a selected model is unavailable", async () => {
+    const selectedModel = createFakeModel("openai-codex", "gpt-5.4-mini");
+    const fallbackModel = createFakeModel("anthropic", "claude-haiku-4-5");
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({
+      models: [selectedModel, fallbackModel],
+      auth: (model) =>
+        model.provider === selectedModel.provider
+          ? { ok: false }
+          : { ok: true, apiKey: "test-key" },
+      notifications,
+    });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("model openai-codex/gpt-5.4-mini", ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      [
+        "pi-tldr status",
+        "enabled: yes",
+        "selected model: openai-codex/gpt-5.4-mini",
+        "active model: anthropic/claude-haiku-4-5",
+      ].join("\n"),
+    );
+  });
+
+  it("reports active model auth check failures", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({
+      auth: () => {
+        throw new Error("auth failed");
+      },
+      notifications,
+    });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      [
+        "pi-tldr status",
+        "enabled: yes",
+        "selected model: auto",
+        "active model: unknown (auth check failed)",
+      ].join("\n"),
+    );
+  });
+
+  it("asks users to retry when status keeps changing during model checks", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    let ctx: ExtensionContext;
+    ctx = createFakeContext({
+      auth: () => {
+        events.get("session_start")?.({}, ctx);
+        return { ok: true, apiKey: "test-key" };
+      },
+      notifications,
+    });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr status", "status changed while checking; run /tldr again"].join(
+        "\n",
+      ),
+    );
+  });
+
   it("drives a prompt-start summary into the widget", async () => {
-    const model = createFakeModel();
     const widgets: Array<unknown> = [];
-    const eventHandlers = new Map<
-      string,
-      (event: any, ctx: ExtensionContext) => void
-    >();
+    const { pi, events } = createFakePiHarness();
     const completeCalls: Array<{ options?: ProviderStreamOptions }> = [];
     const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
       complete: async (_model, _context, options) => {
         completeCalls.push({ options });
         return createAssistantResponse("Inspecting repository status.");
       },
     });
-    const pi = {
-      registerFlag() {},
-      registerCommand() {},
-      on(name: string, handler: (event: any, ctx: ExtensionContext) => void) {
-        eventHandlers.set(name, handler);
-      },
-      getFlag() {
-        return undefined;
-      },
-    } as unknown as ExtensionAPI;
-    const ctx = {
-      hasUI: true,
-      ui: {
-        setWidget(_key: string, widget: unknown) {
-          widgets.push(widget);
-        },
-      },
-      modelRegistry: {
-        find(provider: string, id: string) {
-          return provider === model.provider && id === model.id
-            ? model
-            : undefined;
-        },
-        async getApiKeyAndHeaders() {
-          return { ok: true, apiKey: "test-key" };
-        },
-      },
-    } as unknown as ExtensionContext;
+    const ctx = createFakeContext({ widgets });
 
     extension(pi);
-    eventHandlers.get("session_start")?.({}, ctx);
-    eventHandlers.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
     await waitForTimers();
 
     assert.equal(completeCalls.length, 1);
@@ -140,60 +441,184 @@ describe("piTldr extension entrypoint", () => {
     assert.equal(typeof widgets[2], "function");
   });
 
-  it("clears the widget and aborts stale work after an empty final stop", async () => {
-    const model = createFakeModel();
+  it("aborts in-flight TLDR work when disabled", async () => {
     let abortSignal: AbortSignal | undefined;
     const widgets: Array<unknown> = [];
-    const eventHandlers = new Map<
-      string,
-      (event: any, ctx: ExtensionContext) => void
-    >();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
     const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
       complete: async (_model, _context, options) => {
         abortSignal = options?.signal;
         return new Promise(() => undefined);
       },
     });
-    const pi = {
-      registerFlag() {},
-      registerCommand() {},
-      on(name: string, handler: (event: any, ctx: ExtensionContext) => void) {
-        eventHandlers.set(name, handler);
-      },
-      getFlag() {
-        return undefined;
-      },
-    } as unknown as ExtensionAPI;
-    const ctx = {
-      hasUI: true,
-      ui: {
-        setWidget(_key: string, widget: unknown) {
-          widgets.push(widget);
-        },
-      },
-      modelRegistry: {
-        find(provider: string, id: string) {
-          return provider === model.provider && id === model.id
-            ? model
-            : undefined;
-        },
-        async getApiKeyAndHeaders() {
-          return { ok: true, apiKey: "test-key" };
-        },
-      },
-    } as unknown as ExtensionContext;
+    const ctx = createFakeContext({ notifications, widgets });
 
     extension(pi);
-    eventHandlers.get("session_start")?.({}, ctx);
-    eventHandlers.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
     await waitForTimers();
 
     assert.equal(abortSignal?.aborted, false);
 
-    eventHandlers.get("message_end")?.(
-      { message: createAssistantResponse("") },
+    await commands.get("tldr")?.handler("off", ctx);
+
+    assert.equal(abortSignal?.aborted, true);
+    assert.equal(widgets.at(-1), undefined);
+    assert.equal(
+      notifications.at(-1)?.message,
+      "pi-tldr disabled for this session",
+    );
+  });
+
+  it("does not send facts recorded while disabled after reenable", async () => {
+    let completionPayload = "";
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      complete: async (_model, context) => {
+        completionPayload = JSON.stringify(context);
+        return createAssistantResponse("Inspecting safe follow-up work.");
+      },
+    });
+    const ctx = createFakeContext({});
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("off", ctx);
+    events.get("before_agent_start")?.(
+      { prompt: "Sensitive disabled prompt" },
       ctx,
     );
+    events.get("message_update")?.(
+      { message: createAssistantResponse("Sensitive disabled update") },
+      ctx,
+    );
+    await commands.get("tldr")?.handler("on", ctx);
+    events.get("message_update")?.(
+      { message: createAssistantResponse("Safe enabled update") },
+      ctx,
+    );
+    await waitForTimers();
+
+    assert.equal(completionPayload.includes("Safe enabled update"), true);
+    assert.equal(completionPayload.includes("Sensitive disabled"), false);
+  });
+
+  it("resets disabled state on the next session start", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({ notifications });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("off", ctx);
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      [
+        "pi-tldr status",
+        "enabled: yes",
+        "selected model: auto",
+        "active model: anthropic/claude-haiku-4-5",
+      ].join("\n"),
+    );
+  });
+
+  it("supports /tldr toggle, status, and invalid actions", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({ notifications });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("toggle", ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+    await commands.get("tldr")?.handler("later", ctx);
+
+    assert.equal(
+      notifications.at(-3)?.message,
+      "pi-tldr disabled for this session",
+    );
+    assert.equal(
+      notifications.at(-2)?.message,
+      [
+        "pi-tldr status",
+        "enabled: no",
+        "selected model: auto",
+        "active model: none",
+      ].join("\n"),
+    );
+    assert.deepEqual(notifications.at(-1), {
+      message: "Use /tldr [help|status|on|off|toggle|model <model>]",
+      level: "error",
+    });
+  });
+
+  it("reenables pi-tldr locally after it has been disabled", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({ notifications });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("off", ctx);
+    await commands.get("tldr")?.handler("on", ctx);
+    await commands.get("tldr")?.handler("status", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      [
+        "pi-tldr status",
+        "enabled: yes",
+        "selected model: auto",
+        "active model: anthropic/claude-haiku-4-5",
+      ].join("\n"),
+    );
+  });
+
+  it("clears the widget and aborts stale work after an empty final stop", async () => {
+    let abortSignal: AbortSignal | undefined;
+    const widgets: Array<unknown> = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      complete: async (_model, _context, options) => {
+        abortSignal = options?.signal;
+        return new Promise(() => undefined);
+      },
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await waitForTimers();
+
+    assert.equal(abortSignal?.aborted, false);
+
+    events.get("message_end")?.({ message: createAssistantResponse("") }, ctx);
 
     assert.equal(abortSignal?.aborted, true);
     assert.equal(widgets.at(-1), undefined);

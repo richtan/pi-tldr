@@ -25,6 +25,7 @@ import {
   applyModelPreferenceChoice,
   type FastModelAuth,
   getFastModelAuth,
+  type PreferredModelStore,
   resolveInitialModelPreference,
   selectTldrModel,
   TLDR_MODEL_FLAG,
@@ -43,11 +44,13 @@ const TLDR_REQUEST_TIMEOUT_MS = 8_000;
 type CompleteFunction = typeof complete;
 
 export interface PiTldrDependencies {
-  readonly complete: CompleteFunction;
+  readonly complete?: CompleteFunction;
+  readonly preferredModelStore?: PreferredModelStore;
 }
 
 interface RuntimeState {
   active: boolean;
+  enabled: boolean;
   preferredModel?: TldrModelPreference;
   generation: number;
   refinementGeneration: number;
@@ -65,6 +68,13 @@ interface RefinementRequest {
   readonly facts: string;
   readonly generation: number;
   readonly refinementGeneration: number;
+}
+
+interface StatusSnapshot {
+  readonly enabled: boolean;
+  readonly preferredModel?: TldrModelPreference;
+  readonly modelPreference: string;
+  readonly generation: number;
 }
 
 const TLDR_SYSTEM_PROMPT = `You write live status TLDRs for a terminal coding agent.
@@ -127,6 +137,7 @@ class PiTldrBox implements Component {
 function createInitialState(completeTldr: CompleteFunction): RuntimeState {
   return {
     active: false,
+    enabled: true,
     generation: 0,
     refinementGeneration: 0,
     currentSummary: "",
@@ -155,6 +166,133 @@ function notifyUser(
   level: "info" | "error",
 ): void {
   if (ctx.hasUI) ctx.ui.notify(message, level);
+}
+
+function formatModelPreference(preferredModel?: TldrModelPreference): string {
+  return preferredModel
+    ? `${preferredModel.provider}/${preferredModel.id}`
+    : "auto";
+}
+
+function createStatusSnapshot(state: RuntimeState): StatusSnapshot {
+  return {
+    enabled: state.enabled,
+    preferredModel: state.preferredModel,
+    modelPreference: formatModelPreference(state.preferredModel),
+    generation: state.generation,
+  };
+}
+
+function statusSnapshotMatches(
+  state: RuntimeState,
+  snapshot: StatusSnapshot,
+): boolean {
+  const current = createStatusSnapshot(state);
+  return (
+    current.enabled === snapshot.enabled &&
+    current.modelPreference === snapshot.modelPreference &&
+    current.generation === snapshot.generation
+  );
+}
+
+async function activeModelStatusLine(
+  ctx: ExtensionContext,
+  snapshot: StatusSnapshot,
+): Promise<string> {
+  if (!snapshot.enabled) return "active model: none";
+
+  try {
+    const auth = await getFastModelAuth(ctx, snapshot.preferredModel);
+    return auth
+      ? `active model: ${auth.model.provider}/${auth.model.id}`
+      : "active model: none";
+  } catch {
+    return "active model: unknown (auth check failed)";
+  }
+}
+
+function formatStatusReport(
+  snapshot: StatusSnapshot,
+  activeModelLine: string,
+): string {
+  return [
+    "pi-tldr status",
+    `enabled: ${snapshot.enabled ? "yes" : "no"}`,
+    `selected model: ${snapshot.modelPreference}`,
+    activeModelLine,
+  ].join("\n");
+}
+
+async function createStatusReport(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+): Promise<string> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const snapshot = createStatusSnapshot(state);
+    const activeModelLine = await activeModelStatusLine(ctx, snapshot);
+    if (statusSnapshotMatches(state, snapshot)) {
+      return formatStatusReport(snapshot, activeModelLine);
+    }
+  }
+
+  return [
+    "pi-tldr status",
+    "status changed while checking; run /tldr again",
+  ].join("\n");
+}
+
+async function notifyTldrStatus(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+): Promise<void> {
+  notifyUser(ctx, await createStatusReport(ctx, state), "info");
+}
+
+function notifyTldrHelp(ctx: ExtensionContext): void {
+  notifyUser(
+    ctx,
+    [
+      "pi-tldr commands",
+      "/tldr help - show this help",
+      "/tldr status - show enabled and model status",
+      "/tldr on - enable TLDRs for this session",
+      "/tldr off - disable TLDRs for this session",
+      "/tldr toggle - toggle TLDRs for this session",
+      "/tldr model - choose the TLDR model",
+      "/tldr model <model|auto|reset> - set the TLDR model",
+    ].join("\n"),
+    "info",
+  );
+}
+
+function setTldrEnabled(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  enabled: boolean,
+): void {
+  if (state.enabled === enabled) {
+    notifyUser(
+      ctx,
+      `pi-tldr is already ${enabled ? "enabled" : "disabled"}`,
+      "info",
+    );
+    return;
+  }
+
+  state.enabled = enabled;
+  if (!enabled) {
+    clearPendingWork(state);
+    state.facts.reset();
+    state.currentSummary = "";
+    state.lastFacts = "";
+    clearWidget(ctx);
+    notifyUser(ctx, "pi-tldr disabled for this session", "info");
+    return;
+  }
+
+  state.lastFacts = "";
+  requestRefinement(ctx, state, "now");
+  notifyUser(ctx, "pi-tldr enabled for this session", "info");
 }
 
 function resetRunState(state: RuntimeState, prompt?: string): void {
@@ -193,6 +331,7 @@ function clearPendingWork(state: RuntimeState): void {
 function isCurrent(state: RuntimeState, request: RefinementRequest): boolean {
   return (
     state.active &&
+    state.enabled &&
     request.generation === state.generation &&
     request.refinementGeneration === state.refinementGeneration
   );
@@ -214,7 +353,7 @@ function requestRefinement(
   state: RuntimeState,
   urgency: "debounced" | "now",
 ): void {
-  if (!ctx.hasUI) return;
+  if (!ctx.hasUI || !state.enabled) return;
 
   const facts = state.facts.snapshot();
   if (!facts || facts === state.lastFacts) return;
@@ -296,9 +435,10 @@ async function generateSummary(
 }
 
 export function createPiTldr(
-  dependencies: Partial<PiTldrDependencies> = {},
+  dependencies: PiTldrDependencies = {},
 ): (pi: ExtensionAPI) => void {
   const completeTldr = dependencies.complete ?? complete;
+  const preferredModelStore = dependencies.preferredModelStore;
 
   return (pi: ExtensionAPI): void => {
     pi.registerFlag(TLDR_MODEL_FLAG, {
@@ -309,28 +449,71 @@ export function createPiTldr(
 
     const state = createInitialState(completeTldr);
 
-    pi.registerCommand("tldr-model", {
-      description: "Choose the model used for pi-tldr summaries",
+    pi.registerCommand("tldr", {
+      description: "Control pi-tldr status, enablement, and model selection",
       handler: async (args, ctx) => {
-        let value = args.trim();
-        if (!value) {
-          if (!ctx.hasUI) return;
-
-          const choice = await selectTldrModel(ctx, state.preferredModel);
-          if (!choice) return;
-          value = choice;
-        }
-
-        const update = applyModelPreferenceChoice(value);
-        if (!update.ok) {
-          notifyUser(ctx, update.message, "error");
+        const trimmedArgs = args.trim();
+        if (!trimmedArgs) {
+          notifyTldrHelp(ctx);
           return;
         }
 
-        state.preferredModel = update.preferredModel;
-        state.lastFacts = "";
-        requestRefinement(ctx, state, "now");
-        notifyUser(ctx, update.notice, "info");
+        const [action, ...rest] = trimmedArgs.split(/\s+/);
+        const normalizedAction = action.toLowerCase();
+
+        if (normalizedAction === "help") {
+          notifyTldrHelp(ctx);
+          return;
+        }
+
+        if (normalizedAction === "status") {
+          await notifyTldrStatus(ctx, state);
+          return;
+        }
+
+        if (normalizedAction === "toggle") {
+          setTldrEnabled(ctx, state, !state.enabled);
+          return;
+        }
+
+        if (["on", "enable", "enabled"].includes(normalizedAction)) {
+          setTldrEnabled(ctx, state, true);
+          return;
+        }
+
+        if (["off", "disable", "disabled"].includes(normalizedAction)) {
+          setTldrEnabled(ctx, state, false);
+          return;
+        }
+
+        if (normalizedAction === "model") {
+          let value = rest.join(" ").trim();
+          if (!value) {
+            if (!ctx.hasUI) return;
+
+            const choice = await selectTldrModel(ctx, state.preferredModel);
+            if (!choice) return;
+            value = choice;
+          }
+
+          const update = applyModelPreferenceChoice(value, preferredModelStore);
+          if (!update.ok) {
+            notifyUser(ctx, update.message, "error");
+            return;
+          }
+
+          state.preferredModel = update.preferredModel;
+          state.lastFacts = "";
+          requestRefinement(ctx, state, "now");
+          notifyUser(ctx, update.notice, "info");
+          return;
+        }
+
+        notifyUser(
+          ctx,
+          "Use /tldr [help|status|on|off|toggle|model <model>]",
+          "error",
+        );
       },
     });
 
@@ -338,9 +521,11 @@ export function createPiTldr(
       void event;
       state.generation++;
       state.active = true;
+      state.enabled = true;
       resetRunState(state);
       state.preferredModel = resolveInitialModelPreference(
         pi.getFlag(TLDR_MODEL_FLAG),
+        preferredModelStore,
       );
       clearWidget(ctx);
     });
@@ -353,27 +538,31 @@ export function createPiTldr(
 
     pi.on("before_agent_start", (event, ctx) => {
       state.generation++;
-      resetRunState(state, event.prompt);
+      resetRunState(state, state.enabled ? event.prompt : undefined);
       clearWidget(ctx);
       requestRefinement(ctx, state, "now");
     });
 
     pi.on("message_update", (event, ctx) => {
+      if (!state.enabled) return;
       if (!state.facts.recordAssistantUpdate(event.message)) return;
       requestRefinement(ctx, state, "debounced");
     });
 
     pi.on("tool_call", (event, ctx) => {
+      if (!state.enabled) return;
       state.facts.recordToolCall(event);
       requestRefinement(ctx, state, "now");
     });
 
     pi.on("tool_result", (event, ctx) => {
+      if (!state.enabled) return;
       state.facts.recordToolResult(event);
       requestRefinement(ctx, state, "now");
     });
 
     pi.on("message_end", (event, ctx) => {
+      if (!state.enabled) return;
       const result = state.facts.recordMessageEnd(event.message);
       if (result === "ignored") return;
 

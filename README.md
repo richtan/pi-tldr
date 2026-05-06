@@ -57,7 +57,7 @@ pi --tldr-model anthropic/claude-haiku-4-5
 Or choose from pi's searchable model selector UI:
 
 ```text
-/tldr-model
+/tldr model
 ```
 
 The selector includes `auto` plus the supported TLDR models available with your configured API keys.
@@ -65,20 +65,54 @@ The selector includes `auto` plus the supported TLDR models available with your 
 Set a model directly:
 
 ```text
-/tldr-model anthropic/claude-haiku-4-5
+/tldr model anthropic/claude-haiku-4-5
 ```
 
 Use automatic model selection:
 
 ```text
-/tldr-model auto
+/tldr model auto
 ```
 
 Reset also returns to automatic model selection and removes the saved preference:
 
 ```text
-/tldr-model reset
+/tldr model reset
 ```
+
+Temporarily enable, disable, or toggle pi-tldr for the current session only:
+
+```text
+/tldr on
+/tldr off
+/tldr toggle
+```
+
+This does not change the saved model preference and is reset when a new pi session starts.
+
+Show available pi-tldr commands:
+
+```text
+/tldr
+/tldr help
+```
+
+Check whether pi-tldr is enabled, which model is selected, and which model is active after auth/fallback resolution:
+
+```text
+/tldr status
+```
+
+Example:
+
+```text
+pi-tldr status
+enabled: yes
+selected model: auto
+active model: anthropic/claude-haiku-4-5
+```
+
+If no supported model is available, the active model is `none`. If auth cannot be checked, the active model is `unknown (auth check failed)`.
 
 The selected model is saved across sessions in an extension-owned config file:
 
@@ -94,13 +128,15 @@ Precedence:
 2. saved `pi-tldr.json` preference
 3. `auto`, which uses the supported model list above
 
-If the selected model is unavailable, pi-tldr falls back to `auto`. `/tldr-model reset` removes the saved preference.
+If the selected model is unavailable, pi-tldr falls back to `auto`. `/tldr model reset` removes the saved preference.
+
+Upgrade note: older pi-tldr versions used `/tldr-model` and `/tldr-status`. Use `/tldr model ...` and `/tldr status` instead.
 
 ## Privacy
 
 pi-tldr sends short snippets from recent prompt, assistant, tool, and result activity to the selected TLDR model provider. This activity is generally already part of the pi agent context, but `auto` may send it to an additional or different provider from your main pi model.
 
-pi-tldr does not attempt to detect or redact secrets. It disables prompt caching for TLDR requests and keeps snippets short, but this is not a security boundary. Do not use pi-tldr where sending these snippets to the TLDR provider is unacceptable.
+pi-tldr does not attempt to detect or redact secrets. It disables prompt caching for TLDR requests and keeps snippets short, but this is not a security boundary. Do not use pi-tldr where sending these snippets to the TLDR provider is unacceptable. Use `/tldr off` to stop TLDR requests for the current session.
 
 ## What it does
 
