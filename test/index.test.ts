@@ -226,6 +226,7 @@ describe("piTldr extension entrypoint", () => {
           "pi-tldr commands",
           "/tldr help - show this help",
           "/tldr status - show enabled and model status",
+          "/tldr stats - show session latency stats",
           "/tldr on - enable TLDRs for this session",
           "/tldr off - disable TLDRs for this session",
           "/tldr toggle - toggle TLDRs for this session",
@@ -414,6 +415,104 @@ describe("piTldr extension entrypoint", () => {
     );
   });
 
+  it("reports no latency stats before a TLDR widget update", async () => {
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const ctx = createFakeContext({ notifications });
+
+    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
+      pi,
+    );
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.deepEqual(notifications, [
+      {
+        level: "info",
+        message: ["pi-tldr stats", "avg latency: n/a", "samples: 0"].join("\n"),
+      },
+    ]);
+  });
+
+  it("reports average latency from trigger to accepted widget update", async () => {
+    let now = 1_000;
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const responses = [
+      "Inspecting repository status.",
+      "Updated the project scripts.",
+    ];
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      latencyNow: () => now,
+      complete: async () => {
+        const response = responses.shift();
+        now += response?.startsWith("Inspecting") ? 250 : 450;
+        return createAssistantResponse(response ?? "Finished the task.");
+      },
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await waitForTimers();
+
+    now = 2_000;
+    events.get("before_agent_start")?.({ prompt: "Update scripts" }, ctx);
+    await waitForTimers();
+
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr stats", "avg latency: 350ms", "samples: 2"].join("\n"),
+    );
+  });
+
+  it("resets latency stats on session start", async () => {
+    let now = 1_000;
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      latencyNow: () => now,
+      complete: async () => {
+        now += 125;
+        return createAssistantResponse("Inspecting repository status.");
+      },
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await waitForTimers();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr stats", "avg latency: 125ms", "samples: 1"].join("\n"),
+    );
+
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr stats", "avg latency: n/a", "samples: 0"].join("\n"),
+    );
+  });
+
   it("drives a prompt-start summary into the widget", async () => {
     const widgets: Array<unknown> = [];
     const { pi, events } = createFakePiHarness();
@@ -566,7 +665,7 @@ describe("piTldr extension entrypoint", () => {
       ].join("\n"),
     );
     assert.deepEqual(notifications.at(-1), {
-      message: "Use /tldr [help|status|on|off|toggle|model <model>]",
+      message: "Use /tldr [help|status|stats|on|off|toggle|model <model>]",
       level: "error",
     });
   });

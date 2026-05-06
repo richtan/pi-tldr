@@ -42,10 +42,13 @@ const TLDR_MAX_TOKENS = 80;
 const TLDR_REQUEST_TIMEOUT_MS = 8_000;
 
 type CompleteFunction = typeof complete;
+type Clock = () => number;
 
 export interface PiTldrDependencies {
   readonly complete?: CompleteFunction;
   readonly preferredModelStore?: PreferredModelStore;
+  readonly latencyNow?: Clock;
+  readonly wallClockNow?: Clock;
 }
 
 interface RuntimeState {
@@ -57,17 +60,22 @@ interface RuntimeState {
   currentSummary: string;
   lastFacts: string;
   lastLlmStart: number;
+  latencySamples: number;
+  totalLatencyMs: number;
   pendingRequest?: RefinementRequest;
   updateTimer?: ReturnType<typeof setTimeout>;
   activeRequest?: AbortController;
   readonly facts: TldrFactSession;
   readonly complete: CompleteFunction;
+  readonly latencyNow: Clock;
+  readonly wallClockNow: Clock;
 }
 
 interface RefinementRequest {
   readonly facts: string;
   readonly generation: number;
   readonly refinementGeneration: number;
+  readonly triggeredAtMs: number;
 }
 
 interface StatusSnapshot {
@@ -134,7 +142,11 @@ class PiTldrBox implements Component {
   }
 }
 
-function createInitialState(completeTldr: CompleteFunction): RuntimeState {
+function createInitialState(
+  completeTldr: CompleteFunction,
+  latencyNow: Clock,
+  wallClockNow: Clock,
+): RuntimeState {
   return {
     active: false,
     enabled: true,
@@ -142,9 +154,13 @@ function createInitialState(completeTldr: CompleteFunction): RuntimeState {
     refinementGeneration: 0,
     currentSummary: "",
     lastFacts: "",
-    lastLlmStart: 0,
+    lastLlmStart: Number.NEGATIVE_INFINITY,
+    latencySamples: 0,
+    totalLatencyMs: 0,
     facts: new TldrFactSession(),
     complete: completeTldr,
+    latencyNow,
+    wallClockNow,
   };
 }
 
@@ -255,6 +271,7 @@ function notifyTldrHelp(ctx: ExtensionContext): void {
       "pi-tldr commands",
       "/tldr help - show this help",
       "/tldr status - show enabled and model status",
+      "/tldr stats - show session latency stats",
       "/tldr on - enable TLDRs for this session",
       "/tldr off - disable TLDRs for this session",
       "/tldr toggle - toggle TLDRs for this session",
@@ -263,6 +280,22 @@ function notifyTldrHelp(ctx: ExtensionContext): void {
     ].join("\n"),
     "info",
   );
+}
+
+function formatLatencyStats(state: RuntimeState): string {
+  const averageLatency = state.latencySamples
+    ? `${Math.round(state.totalLatencyMs / state.latencySamples)}ms`
+    : "n/a";
+
+  return [
+    "pi-tldr stats",
+    `avg latency: ${averageLatency}`,
+    `samples: ${state.latencySamples}`,
+  ].join("\n");
+}
+
+function notifyTldrStats(ctx: ExtensionContext, state: RuntimeState): void {
+  notifyUser(ctx, formatLatencyStats(state), "info");
 }
 
 function setTldrEnabled(
@@ -300,6 +333,11 @@ function resetRunState(state: RuntimeState, prompt?: string): void {
   state.facts.reset(prompt);
   state.currentSummary = "";
   state.lastFacts = "";
+}
+
+function resetLatencyStats(state: RuntimeState): void {
+  state.latencySamples = 0;
+  state.totalLatencyMs = 0;
 }
 
 function createCompletionOptions(
@@ -341,11 +379,20 @@ function renderSummary(
   ctx: ExtensionContext,
   state: RuntimeState,
   summary: string,
-): void {
-  if (summary === state.currentSummary) return;
+): boolean {
+  if (summary === state.currentSummary) return false;
 
   state.currentSummary = summary;
   showWidget(ctx, summary);
+  return true;
+}
+
+function recordLatency(state: RuntimeState, request: RefinementRequest): void {
+  state.latencySamples++;
+  state.totalLatencyMs += Math.max(
+    0,
+    state.latencyNow() - request.triggeredAtMs,
+  );
 }
 
 function requestRefinement(
@@ -364,12 +411,13 @@ function requestRefinement(
     facts,
     generation: state.generation,
     refinementGeneration: state.refinementGeneration,
+    triggeredAtMs: state.latencyNow(),
   };
   state.activeRequest?.abort();
   state.activeRequest = undefined;
 
   if (state.updateTimer) clearTimeout(state.updateTimer);
-  const elapsedSinceLastLlm = Date.now() - state.lastLlmStart;
+  const elapsedSinceLastLlm = state.latencyNow() - state.lastLlmStart;
   const delay =
     urgency === "now"
       ? 0
@@ -403,7 +451,7 @@ async function generateSummary(
 
   const abortController = new AbortController();
   state.activeRequest = abortController;
-  state.lastLlmStart = Date.now();
+  state.lastLlmStart = state.latencyNow();
 
   try {
     const message: UserMessage = {
@@ -414,7 +462,7 @@ async function generateSummary(
           text: `Current event facts:\n${request.facts}`,
         },
       ],
-      timestamp: Date.now(),
+      timestamp: state.wallClockNow(),
     };
     const response = await state.complete(
       auth.model,
@@ -425,7 +473,9 @@ async function generateSummary(
 
     const responseText = extractTextContent(response.content) ?? "";
     const summary = extractSummary(responseText, MAX_SUMMARY_CHARS);
-    if (summary) renderSummary(ctx, state, summary);
+    if (summary && renderSummary(ctx, state, summary)) {
+      recordLatency(state, request);
+    }
   } catch {
     // TLDR refinement is optional; keep the previous accepted TLDR on failure.
   } finally {
@@ -439,6 +489,8 @@ export function createPiTldr(
 ): (pi: ExtensionAPI) => void {
   const completeTldr = dependencies.complete ?? complete;
   const preferredModelStore = dependencies.preferredModelStore;
+  const latencyNow = dependencies.latencyNow ?? (() => performance.now());
+  const wallClockNow = dependencies.wallClockNow ?? Date.now;
 
   return (pi: ExtensionAPI): void => {
     pi.registerFlag(TLDR_MODEL_FLAG, {
@@ -447,7 +499,7 @@ export function createPiTldr(
       type: "string",
     });
 
-    const state = createInitialState(completeTldr);
+    const state = createInitialState(completeTldr, latencyNow, wallClockNow);
 
     pi.registerCommand("tldr", {
       description: "Control pi-tldr status, enablement, and model selection",
@@ -468,6 +520,11 @@ export function createPiTldr(
 
         if (normalizedAction === "status") {
           await notifyTldrStatus(ctx, state);
+          return;
+        }
+
+        if (normalizedAction === "stats") {
+          notifyTldrStats(ctx, state);
           return;
         }
 
@@ -511,7 +568,7 @@ export function createPiTldr(
 
         notifyUser(
           ctx,
-          "Use /tldr [help|status|on|off|toggle|model <model>]",
+          "Use /tldr [help|status|stats|on|off|toggle|model <model>]",
           "error",
         );
       },
@@ -523,6 +580,7 @@ export function createPiTldr(
       state.active = true;
       state.enabled = true;
       resetRunState(state);
+      resetLatencyStats(state);
       state.preferredModel = resolveInitialModelPreference(
         pi.getFlag(TLDR_MODEL_FLAG),
         preferredModelStore,

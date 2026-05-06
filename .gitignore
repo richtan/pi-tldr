@@ -28,5 +28,6 @@ pnpm-debug.log*
 .idea/
 .vscode/
 
-# Agent-local task notes
+# Agent-local instructions and task notes
+AGENTS.md
 tasks/
