@@ -73,7 +73,7 @@ describe("TldrFactSession", () => {
 
     assert.equal(
       facts.snapshot(),
-      "prompt=Please inspect the repository status\nevent=message_update\nassistantText=Checking recent changes before continuing",
+      "prompt=Please inspect the repository status\nevent=message_update\ncurrentActivity=true\nassistantText=Checking recent changes before continuing",
     );
   });
 
@@ -95,7 +95,7 @@ describe("TldrFactSession", () => {
 
     assert.equal(
       facts.snapshot(),
-      "event=tool_start\ntool=bash\ncommand=npm test\nevent=tool_end\ntool=bash\ncommand=npm test\nisError=false\nresult=Tests passed",
+      "event=tool_start\ntool=bash\ncommand=npm test\nevent=tool_end\ncurrentActivity=true\ntool=bash\ncommand=npm test\nisError=false\nresult=Tests passed",
     );
   });
 
@@ -112,7 +112,7 @@ describe("TldrFactSession", () => {
 
     assert.equal(
       facts.snapshot(),
-      "event=tool_end\ntool=custom_tool\nisError=true\nresult=Failed",
+      "event=tool_end\ncurrentActivity=true\ntool=custom_tool\nisError=true\nresult=Failed",
     );
   });
 
@@ -133,7 +133,7 @@ describe("TldrFactSession", () => {
 
     assert.equal(
       facts.snapshot(),
-      "event=tool_start\ntool=read\npath=src/index.ts\noffset=5\nlimit=20\nevent=tool_start\ntool=edit\npath=README.md\neditCount=1",
+      "event=tool_start\ntool=read\npath=src/index.ts\noffset=5\nlimit=20\nevent=tool_start\ncurrentActivity=true\ntool=edit\npath=README.md\neditCount=1",
     );
   });
 
@@ -168,7 +168,7 @@ describe("TldrFactSession", () => {
         "event=tool_start\ntool=grep\npattern=TODO\npath=src\nglob=*.ts",
         "event=tool_start\ntool=find\npattern=*.test.ts\npath=test",
         "event=tool_start\ntool=ls\npath=src",
-        "event=tool_start\ntool=write\npath=notes.txt",
+        "event=tool_start\ncurrentActivity=true\ntool=write\npath=notes.txt",
       ].join("\n"),
     );
   });
@@ -227,7 +227,7 @@ describe("TldrFactSession", () => {
     assert.equal(facts.recordMessageEnd(assistantMessage("Done.")), "recorded");
     assert.equal(
       facts.snapshot(),
-      "prompt=Summarize this\nevent=message_end\nstopReason=stop\nfinalResultContext=Done.",
+      "prompt=Summarize this\nevent=message_end\ncurrentActivity=true\nstopReason=stop\nfinalResultContext=Done.",
     );
   });
 
@@ -241,7 +241,7 @@ describe("TldrFactSession", () => {
     assert.equal(facts.recordMessageEnd(message), "recorded");
     assert.equal(
       facts.snapshot(),
-      "event=message_end\nstopReason=error\nerrorMessage=Provider failed",
+      "event=message_end\ncurrentActivity=true\nstopReason=error\nerrorMessage=Provider failed",
     );
   });
 });

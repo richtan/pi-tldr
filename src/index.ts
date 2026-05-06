@@ -38,18 +38,29 @@ const TITLE = " tldr ";
 const MIN_BOX_WIDTH = 12;
 const MAX_SUMMARY_CHARS = 180;
 const LLM_UPDATE_INTERVAL_MS = 1_200;
+const TOOL_ACTIVITY_COALESCE_MS = 300;
 const TLDR_MAX_TOKENS = 80;
 const TLDR_REQUEST_TIMEOUT_MS = 8_000;
 
 type CompleteFunction = typeof complete;
 type Clock = () => number;
+type TimerHandle = unknown;
+
+export interface TldrScheduler {
+  setTimeout(callback: () => void, delayMs: number): TimerHandle;
+  clearTimeout(handle: TimerHandle): void;
+}
 
 export interface PiTldrDependencies {
   readonly complete?: CompleteFunction;
   readonly preferredModelStore?: PreferredModelStore;
   readonly latencyNow?: Clock;
   readonly wallClockNow?: Clock;
+  readonly toolActivityCoalesceMs?: number;
+  readonly scheduler?: TldrScheduler;
 }
+
+type RefinementUrgency = "now" | "debounced" | "coalesced";
 
 interface RuntimeState {
   active: boolean;
@@ -63,12 +74,21 @@ interface RuntimeState {
   latencySamples: number;
   totalLatencyMs: number;
   pendingRequest?: RefinementRequest;
-  updateTimer?: ReturnType<typeof setTimeout>;
+  updateTimer?: TimerHandle;
   activeRequest?: AbortController;
+  cachedAuth?: CachedAuth;
+  authCacheVersion: number;
   readonly facts: TldrFactSession;
   readonly complete: CompleteFunction;
   readonly latencyNow: Clock;
   readonly wallClockNow: Clock;
+  readonly toolActivityCoalesceMs: number;
+  readonly scheduler: TldrScheduler;
+}
+
+interface CachedAuth {
+  readonly modelKey: string;
+  readonly auth: FastModelAuth;
 }
 
 interface RefinementRequest {
@@ -88,7 +108,8 @@ interface StatusSnapshot {
 const TLDR_SYSTEM_PROMPT = `You write live status TLDRs for a terminal coding agent.
 Return one short, complete, plain-English sentence.
 The sentence must be complete and must not trail off.
-Describe the current workflow step for the user's task.
+Describe what the agent is doing right now for the user's task.
+Prioritize the latest event facts; use earlier facts only as context.
 For in-progress work, start with a present-tense action verb form ending in -ing.
 For final results or completed work, start with a past-tense action verb.
 Do not use first person.
@@ -142,10 +163,23 @@ class PiTldrBox implements Component {
   }
 }
 
+function createDefaultScheduler(): TldrScheduler {
+  return {
+    setTimeout(callback, delayMs) {
+      return setTimeout(callback, delayMs);
+    },
+    clearTimeout(handle) {
+      clearTimeout(handle as ReturnType<typeof setTimeout>);
+    },
+  };
+}
+
 function createInitialState(
   completeTldr: CompleteFunction,
   latencyNow: Clock,
   wallClockNow: Clock,
+  toolActivityCoalesceMs: number,
+  scheduler: TldrScheduler,
 ): RuntimeState {
   return {
     active: false,
@@ -157,10 +191,13 @@ function createInitialState(
     lastLlmStart: Number.NEGATIVE_INFINITY,
     latencySamples: 0,
     totalLatencyMs: 0,
+    authCacheVersion: 0,
     facts: new TldrFactSession(),
     complete: completeTldr,
     latencyNow,
     wallClockNow,
+    toolActivityCoalesceMs,
+    scheduler,
   };
 }
 
@@ -185,9 +222,15 @@ function notifyUser(
 }
 
 function formatModelPreference(preferredModel?: TldrModelPreference): string {
-  return preferredModel
-    ? `${preferredModel.provider}/${preferredModel.id}`
-    : "auto";
+  return preferredModel ? formatTldrModelKey(preferredModel) : "auto";
+}
+
+function formatTldrModelKey({ provider, id }: TldrModelPreference): string {
+  return `${provider}/${id}`;
+}
+
+function formatAuthModelKey(auth: FastModelAuth): string {
+  return `${auth.model.provider}/${auth.model.id}`;
 }
 
 function createStatusSnapshot(state: RuntimeState): StatusSnapshot {
@@ -303,6 +346,8 @@ function setTldrEnabled(
   state: RuntimeState,
   enabled: boolean,
 ): void {
+  if (!enabled) clearCachedAuth(state);
+
   if (state.enabled === enabled) {
     notifyUser(
       ctx,
@@ -340,6 +385,11 @@ function resetLatencyStats(state: RuntimeState): void {
   state.totalLatencyMs = 0;
 }
 
+function clearCachedAuth(state: RuntimeState): void {
+  state.authCacheVersion++;
+  state.cachedAuth = undefined;
+}
+
 function createCompletionOptions(
   auth: FastModelAuth,
   signal: AbortSignal,
@@ -359,7 +409,9 @@ function createCompletionOptions(
 
 function clearPendingWork(state: RuntimeState): void {
   state.refinementGeneration++;
-  if (state.updateTimer) clearTimeout(state.updateTimer);
+  if (state.updateTimer !== undefined) {
+    state.scheduler.clearTimeout(state.updateTimer);
+  }
   state.updateTimer = undefined;
   state.pendingRequest = undefined;
   state.activeRequest?.abort();
@@ -398,7 +450,7 @@ function recordLatency(state: RuntimeState, request: RefinementRequest): void {
 function requestRefinement(
   ctx: ExtensionContext,
   state: RuntimeState,
-  urgency: "debounced" | "now",
+  urgency: RefinementUrgency,
 ): void {
   if (!ctx.hasUI || !state.enabled) return;
 
@@ -416,13 +468,60 @@ function requestRefinement(
   state.activeRequest?.abort();
   state.activeRequest = undefined;
 
-  if (state.updateTimer) clearTimeout(state.updateTimer);
+  if (state.updateTimer !== undefined) {
+    state.scheduler.clearTimeout(state.updateTimer);
+  }
   const elapsedSinceLastLlm = state.latencyNow() - state.lastLlmStart;
-  const delay =
-    urgency === "now"
-      ? 0
-      : Math.max(0, LLM_UPDATE_INTERVAL_MS - elapsedSinceLastLlm);
-  state.updateTimer = setTimeout(() => flushRefinement(ctx, state), delay);
+  const delay = refinementDelay(state, urgency, elapsedSinceLastLlm);
+  state.updateTimer = state.scheduler.setTimeout(
+    () => flushRefinement(ctx, state),
+    delay,
+  );
+}
+
+function refinementDelay(
+  state: RuntimeState,
+  urgency: RefinementUrgency,
+  elapsedSinceLastLlm: number,
+): number {
+  switch (urgency) {
+    case "now":
+      return 0;
+    case "coalesced":
+      return state.toolActivityCoalesceMs;
+    case "debounced":
+      return Math.max(0, LLM_UPDATE_INTERVAL_MS - elapsedSinceLastLlm);
+  }
+}
+
+async function resolveTldrAuth(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  request: RefinementRequest,
+): Promise<FastModelAuth | undefined> {
+  const requestedModelKey = state.preferredModel
+    ? formatTldrModelKey(state.preferredModel)
+    : undefined;
+  if (requestedModelKey && state.cachedAuth?.modelKey === requestedModelKey) {
+    return state.cachedAuth.auth;
+  }
+
+  const cacheVersion = state.authCacheVersion;
+  const auth = await getFastModelAuth(ctx, state.preferredModel);
+  if (
+    auth &&
+    requestedModelKey &&
+    cacheVersion === state.authCacheVersion &&
+    isCurrent(state, request) &&
+    requestedModelKey ===
+      (state.preferredModel
+        ? formatTldrModelKey(state.preferredModel)
+        : undefined) &&
+    requestedModelKey === formatAuthModelKey(auth)
+  ) {
+    state.cachedAuth = { modelKey: requestedModelKey, auth };
+  }
+  return auth;
 }
 
 function flushRefinement(ctx: ExtensionContext, state: RuntimeState): void {
@@ -443,8 +542,9 @@ async function generateSummary(
 
   let auth: FastModelAuth | undefined;
   try {
-    auth = await getFastModelAuth(ctx, state.preferredModel);
+    auth = await resolveTldrAuth(ctx, state, request);
   } catch {
+    clearCachedAuth(state);
     return;
   }
   if (!auth || !isCurrent(state, request)) return;
@@ -469,7 +569,11 @@ async function generateSummary(
       { systemPrompt: TLDR_SYSTEM_PROMPT, messages: [message] },
       createCompletionOptions(auth, abortController.signal),
     );
-    if (!isCurrent(state, request) || response.stopReason !== "stop") return;
+    if (!isCurrent(state, request)) return;
+    if (response.stopReason !== "stop") {
+      if (response.stopReason === "error") clearCachedAuth(state);
+      return;
+    }
 
     const responseText = extractTextContent(response.content) ?? "";
     const summary = extractSummary(responseText, MAX_SUMMARY_CHARS);
@@ -477,6 +581,7 @@ async function generateSummary(
       recordLatency(state, request);
     }
   } catch {
+    if (!abortController.signal.aborted) clearCachedAuth(state);
     // TLDR refinement is optional; keep the previous accepted TLDR on failure.
   } finally {
     if (state.activeRequest === abortController)
@@ -491,6 +596,11 @@ export function createPiTldr(
   const preferredModelStore = dependencies.preferredModelStore;
   const latencyNow = dependencies.latencyNow ?? (() => performance.now());
   const wallClockNow = dependencies.wallClockNow ?? Date.now;
+  const toolActivityCoalesceMs = Math.max(
+    0,
+    dependencies.toolActivityCoalesceMs ?? TOOL_ACTIVITY_COALESCE_MS,
+  );
+  const scheduler = dependencies.scheduler ?? createDefaultScheduler();
 
   return (pi: ExtensionAPI): void => {
     pi.registerFlag(TLDR_MODEL_FLAG, {
@@ -499,7 +609,13 @@ export function createPiTldr(
       type: "string",
     });
 
-    const state = createInitialState(completeTldr, latencyNow, wallClockNow);
+    const state = createInitialState(
+      completeTldr,
+      latencyNow,
+      wallClockNow,
+      toolActivityCoalesceMs,
+      scheduler,
+    );
 
     pi.registerCommand("tldr", {
       description: "Control pi-tldr status, enablement, and model selection",
@@ -560,6 +676,7 @@ export function createPiTldr(
           }
 
           state.preferredModel = update.preferredModel;
+          clearCachedAuth(state);
           state.lastFacts = "";
           requestRefinement(ctx, state, "now");
           notifyUser(ctx, update.notice, "info");
@@ -581,6 +698,7 @@ export function createPiTldr(
       state.enabled = true;
       resetRunState(state);
       resetLatencyStats(state);
+      clearCachedAuth(state);
       state.preferredModel = resolveInitialModelPreference(
         pi.getFlag(TLDR_MODEL_FLAG),
         preferredModelStore,
@@ -592,6 +710,7 @@ export function createPiTldr(
       state.active = false;
       state.generation++;
       resetRunState(state);
+      clearCachedAuth(state);
     });
 
     pi.on("before_agent_start", (event, ctx) => {
@@ -610,13 +729,13 @@ export function createPiTldr(
     pi.on("tool_call", (event, ctx) => {
       if (!state.enabled) return;
       state.facts.recordToolCall(event);
-      requestRefinement(ctx, state, "now");
+      requestRefinement(ctx, state, "coalesced");
     });
 
     pi.on("tool_result", (event, ctx) => {
       if (!state.enabled) return;
       state.facts.recordToolResult(event);
-      requestRefinement(ctx, state, "now");
+      requestRefinement(ctx, state, "coalesced");
     });
 
     pi.on("message_end", (event, ctx) => {

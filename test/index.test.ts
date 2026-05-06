@@ -10,7 +10,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
-import { createPiTldr, piTldr } from "../src/index.js";
+import { createPiTldr, piTldr, type TldrScheduler } from "../src/index.js";
 import type { PreferredModelStore } from "../src/tldr-models.js";
 
 type EventHandler = (
@@ -50,11 +50,14 @@ function createFakeModel(
   } as Model<Api>;
 }
 
-function createAssistantResponse(text: string): AssistantMessage {
+function createAssistantResponse(
+  text: string,
+  stopReason: AssistantMessage["stopReason"] = "stop",
+): AssistantMessage {
   return {
     role: "assistant",
     content: [{ type: "text", text }],
-    stopReason: "stop",
+    stopReason,
     timestamp: Date.now(),
     usage: {
       input: 0,
@@ -144,7 +147,63 @@ function createFakeContext(options: {
 }
 
 function waitForTimers(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 5));
+  return waitForMs(5);
+}
+
+function waitForMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface FakeScheduledTask {
+  readonly callback: () => void;
+  readonly runAtMs: number;
+  canceled: boolean;
+}
+
+class FakeScheduler implements TldrScheduler {
+  private nowMs = 0;
+  private readonly tasks: FakeScheduledTask[] = [];
+
+  public setTimeout(callback: () => void, delayMs: number): FakeScheduledTask {
+    const task = {
+      callback,
+      runAtMs: this.nowMs + Math.max(0, delayMs),
+      canceled: false,
+    };
+    this.tasks.push(task);
+    return task;
+  }
+
+  public clearTimeout(handle: unknown): void {
+    (handle as FakeScheduledTask).canceled = true;
+  }
+
+  public advanceBy(ms: number): void {
+    const targetMs = this.nowMs + ms;
+
+    while (true) {
+      const nextTask = this.nextDueTask(targetMs);
+      if (!nextTask) break;
+
+      this.nowMs = nextTask.runAtMs;
+      nextTask.canceled = true;
+      nextTask.callback();
+    }
+
+    this.nowMs = targetMs;
+  }
+
+  private nextDueTask(targetMs: number): FakeScheduledTask | undefined {
+    return this.tasks
+      .filter((task) => !task.canceled && task.runAtMs <= targetMs)
+      .sort((left, right) => left.runAtMs - right.runAtMs)[0];
+  }
+}
+
+async function flushAsyncWork(): Promise<void> {
+  for (let step = 0; step < 5; step++) {
+    await Promise.resolve();
+  }
 }
 
 describe("piTldr extension entrypoint", () => {
@@ -386,6 +445,377 @@ describe("piTldr extension entrypoint", () => {
     );
   });
 
+  it("reuses cached TLDR auth across agent runs", async () => {
+    const scheduler = new FakeScheduler();
+    let authCalls = 0;
+    let completionCalls = 0;
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      complete: async () => {
+        completionCalls++;
+        return createAssistantResponse(`Summarized step ${completionCalls}.`);
+      },
+    });
+    const ctx = createFakeContext({
+      auth: () => {
+        authCalls++;
+        return { ok: true, apiKey: "test-key" };
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands
+      .get("tldr")
+      ?.handler("model anthropic/claude-haiku-4-5", ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    events.get("before_agent_start")?.({ prompt: "Update docs" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(completionCalls, 2);
+    assert.equal(authCalls, 1);
+  });
+
+  it("invalidates cached TLDR auth when the selected model changes", async () => {
+    const scheduler = new FakeScheduler();
+    const authProviders: string[] = [];
+    const anthropicModel = createFakeModel("anthropic", "claude-haiku-4-5");
+    const openaiModel = createFakeModel("openai-codex", "gpt-5.4-mini");
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      complete: async () => createAssistantResponse("Updated current status."),
+    });
+    const ctx = createFakeContext({
+      models: [anthropicModel, openaiModel],
+      auth: (model) => {
+        authProviders.push(model.provider);
+        return { ok: true, apiKey: "test-key" };
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands
+      .get("tldr")
+      ?.handler("model anthropic/claude-haiku-4-5", ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    await commands.get("tldr")?.handler("model openai-codex/gpt-5.4-mini", ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.deepEqual(authProviders, ["anthropic", "openai-codex"]);
+  });
+
+  it("clears cached TLDR auth after thrown generation failures", async () => {
+    const scheduler = new FakeScheduler();
+    let authCalls = 0;
+    let completionCalls = 0;
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      complete: async () => {
+        completionCalls++;
+        if (completionCalls === 1) throw new Error("provider failed");
+        return createAssistantResponse("Recovered current status.");
+      },
+    });
+    const ctx = createFakeContext({
+      auth: () => {
+        authCalls++;
+        return { ok: true, apiKey: "test-key" };
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands
+      .get("tldr")
+      ?.handler("model anthropic/claude-haiku-4-5", ctx);
+    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(completionCalls, 2);
+    assert.equal(authCalls, 2);
+  });
+
+  it("clears cached TLDR auth after error responses", async () => {
+    const scheduler = new FakeScheduler();
+    let authCalls = 0;
+    let completionCalls = 0;
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      complete: async () => {
+        completionCalls++;
+        return completionCalls === 1
+          ? createAssistantResponse("Provider failed.", "error")
+          : createAssistantResponse("Recovered current status.");
+      },
+    });
+    const ctx = createFakeContext({
+      auth: () => {
+        authCalls++;
+        return { ok: true, apiKey: "test-key" };
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands
+      .get("tldr")
+      ?.handler("model anthropic/claude-haiku-4-5", ctx);
+    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(completionCalls, 2);
+    assert.equal(authCalls, 2);
+  });
+
+  it("does not cache auth resolved after cache invalidation", async () => {
+    const scheduler = new FakeScheduler();
+    let authCalls = 0;
+    let resolveAuth: ((result: FakeAuthResult) => void) | undefined;
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      complete: async () => createAssistantResponse("Summarized status."),
+    });
+    const ctx = createFakeContext({
+      auth: () => {
+        authCalls++;
+        if (authCalls === 1) {
+          return new Promise<FakeAuthResult>((resolve) => {
+            resolveAuth = resolve;
+          });
+        }
+        return { ok: true, apiKey: "test-key" };
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands
+      .get("tldr")
+      ?.handler("model anthropic/claude-haiku-4-5", ctx);
+    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(authCalls, 1);
+
+    events.get("session_start")?.({}, ctx);
+    resolveAuth?.({ ok: true, apiKey: "stale-key" });
+    await flushAsyncWork();
+
+    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(authCalls, 2);
+  });
+
+  it("does not cache auth from a superseded pending refinement", async () => {
+    const scheduler = new FakeScheduler();
+    let authCalls = 0;
+    let resolveFirstAuth: ((result: FakeAuthResult) => void) | undefined;
+    const completionKeys: string[] = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      complete: async (_model, _context, options) => {
+        completionKeys.push(options?.apiKey ?? "");
+        return createAssistantResponse("Summarized latest status.");
+      },
+    });
+    const ctx = createFakeContext({
+      auth: () => {
+        authCalls++;
+        if (authCalls === 1) {
+          return new Promise<FakeAuthResult>((resolve) => {
+            resolveFirstAuth = resolve;
+          });
+        }
+        return { ok: true, apiKey: "fresh-key" };
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands
+      .get("tldr")
+      ?.handler("model anthropic/claude-haiku-4-5", ctx);
+    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(authCalls, 1);
+
+    events.get("message_update")?.(
+      { message: createAssistantResponse("Writing a newer status") },
+      ctx,
+    );
+    resolveFirstAuth?.({ ok: true, apiKey: "stale-key" });
+    await flushAsyncWork();
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(authCalls, 2);
+    assert.deepEqual(completionKeys, ["fresh-key"]);
+  });
+
+  it("does not cache automatic fallback auth across agent runs", async () => {
+    const scheduler = new FakeScheduler();
+    let anthropicAvailable = false;
+    const completionModels: string[] = [];
+    const anthropicModel = createFakeModel("anthropic", "claude-haiku-4-5");
+    const openaiModel = createFakeModel("openai-codex", "gpt-5.4-mini");
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      complete: async (model, _context, options) => {
+        completionModels.push(
+          `${model.provider}/${model.id}:${options?.apiKey}`,
+        );
+        return createAssistantResponse(`Summarized with ${model.provider}.`);
+      },
+    });
+    const ctx = createFakeContext({
+      models: [anthropicModel, openaiModel],
+      auth: (model) => {
+        if (model.provider === "anthropic" && !anthropicAvailable) {
+          return { ok: false };
+        }
+        return { ok: true, apiKey: `${model.provider}-key` };
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    anthropicAvailable = true;
+    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.deepEqual(completionModels, [
+      "openai-codex/gpt-5.4-mini:openai-codex-key",
+      "anthropic/claude-haiku-4-5:anthropic-key",
+    ]);
+  });
+
+  it("does not cache selected-model fallback auth across agent runs", async () => {
+    const scheduler = new FakeScheduler();
+    let selectedAvailable = false;
+    const completionModels: string[] = [];
+    const selectedModel = createFakeModel("openai-codex", "gpt-5.4-mini");
+    const fallbackModel = createFakeModel("anthropic", "claude-haiku-4-5");
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      complete: async (model, _context, options) => {
+        completionModels.push(
+          `${model.provider}/${model.id}:${options?.apiKey}`,
+        );
+        return createAssistantResponse(`Summarized with ${model.provider}.`);
+      },
+    });
+    const ctx = createFakeContext({
+      models: [selectedModel, fallbackModel],
+      auth: (model) => {
+        if (model.provider === "openai-codex" && !selectedAvailable) {
+          return { ok: false };
+        }
+        return { ok: true, apiKey: `${model.provider}-key` };
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("model openai-codex/gpt-5.4-mini", ctx);
+    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    selectedAvailable = true;
+    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.deepEqual(completionModels, [
+      "anthropic/claude-haiku-4-5:anthropic-key",
+      "openai-codex/gpt-5.4-mini:openai-codex-key",
+    ]);
+  });
+
+  it("clears cached TLDR auth when disabled", async () => {
+    const scheduler = new FakeScheduler();
+    let authCalls = 0;
+    const completionKeys: string[] = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      complete: async (_model, _context, options) => {
+        completionKeys.push(options?.apiKey ?? "");
+        return createAssistantResponse("Summarized current status.");
+      },
+    });
+    const ctx = createFakeContext({
+      auth: () => {
+        authCalls++;
+        return { ok: true, apiKey: `key-${authCalls}` };
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands
+      .get("tldr")
+      ?.handler("model anthropic/claude-haiku-4-5", ctx);
+    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    await commands.get("tldr")?.handler("off", ctx);
+    await commands.get("tldr")?.handler("on", ctx);
+    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(authCalls, 2);
+    assert.deepEqual(completionKeys, ["key-1", "key-2"]);
+  });
+
   it("asks users to retry when status keeps changing during model checks", async () => {
     const notifications: Array<{
       readonly message: string;
@@ -511,6 +941,177 @@ describe("piTldr extension entrypoint", () => {
       notifications.at(-1)?.message,
       ["pi-tldr stats", "avg latency: n/a", "samples: 0"].join("\n"),
     );
+  });
+
+  it("coalesces quick tool activity into one TLDR request", async () => {
+    const scheduler = new FakeScheduler();
+    const completionPayloads: string[] = [];
+    const systemPrompts: string[] = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      toolActivityCoalesceMs: 20,
+      scheduler,
+      complete: async (_model, context) => {
+        completionPayloads.push(JSON.stringify(context));
+        systemPrompts.push(context.systemPrompt ?? "");
+        return createAssistantResponse("Checking command results.");
+      },
+    });
+    const ctx = createFakeContext({});
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("tool_call")?.(
+      {
+        toolName: "bash",
+        toolCallId: "tool-1",
+        input: { command: "npm test" },
+      },
+      ctx,
+    );
+    scheduler.advanceBy(19);
+    await flushAsyncWork();
+
+    assert.equal(completionPayloads.length, 0);
+
+    events.get("tool_result")?.(
+      {
+        toolName: "bash",
+        toolCallId: "tool-1",
+        isError: false,
+        content: [{ type: "text", text: "Tests passed" }],
+      },
+      ctx,
+    );
+    scheduler.advanceBy(19);
+    await flushAsyncWork();
+
+    assert.equal(completionPayloads.length, 0);
+
+    scheduler.advanceBy(1);
+    await flushAsyncWork();
+
+    assert.equal(completionPayloads.length, 1);
+    assert.match(systemPrompts[0] ?? "", /doing right now/);
+    assert.match(systemPrompts[0] ?? "", /latest event facts/);
+    assert.match(completionPayloads[0] ?? "", /tool_end/);
+    assert.match(completionPayloads[0] ?? "", /Tests passed/);
+  });
+
+  it("lets final summaries bypass pending tool coalescing", async () => {
+    const scheduler = new FakeScheduler();
+    const completionPayloads: string[] = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      toolActivityCoalesceMs: 50,
+      scheduler,
+      complete: async (_model, context) => {
+        completionPayloads.push(JSON.stringify(context));
+        return createAssistantResponse("Completed the requested change.");
+      },
+    });
+    const ctx = createFakeContext({});
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("tool_call")?.(
+      {
+        toolName: "bash",
+        toolCallId: "tool-1",
+        input: { command: "npm test" },
+      },
+      ctx,
+    );
+    scheduler.advanceBy(49);
+    await flushAsyncWork();
+
+    assert.equal(completionPayloads.length, 0);
+
+    events.get("message_end")?.(
+      { message: createAssistantResponse("All done.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(completionPayloads.length, 1);
+    assert.match(completionPayloads[0] ?? "", /message_end/);
+    assert.match(completionPayloads[0] ?? "", /All done/);
+    assert.doesNotMatch(completionPayloads[0] ?? "", /tool_start/);
+
+    scheduler.advanceBy(50);
+    await flushAsyncWork();
+
+    assert.equal(completionPayloads.length, 1);
+  });
+
+  it("ignores an in-flight tool TLDR after a final summary starts", async () => {
+    const scheduler = new FakeScheduler();
+    const widgets: Array<unknown> = [];
+    const completions: Array<{
+      readonly context: string;
+      readonly options?: ProviderStreamOptions;
+      readonly resolve: (
+        response: ReturnType<typeof createAssistantResponse>,
+      ) => void;
+    }> = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      toolActivityCoalesceMs: 20,
+      scheduler,
+      complete: async (_model, context, options) =>
+        new Promise<ReturnType<typeof createAssistantResponse>>((resolve) => {
+          completions.push({
+            context: JSON.stringify(context),
+            options,
+            resolve,
+          });
+        }),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("tool_call")?.(
+      {
+        toolName: "bash",
+        toolCallId: "tool-1",
+        input: { command: "npm test" },
+      },
+      ctx,
+    );
+    scheduler.advanceBy(20);
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+    assert.match(completions[0]?.context ?? "", /tool_start/);
+    assert.equal(completions[0]?.options?.signal?.aborted, false);
+
+    events.get("message_end")?.(
+      { message: createAssistantResponse("All done.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 2);
+    assert.equal(completions[0]?.options?.signal?.aborted, true);
+    assert.match(completions[1]?.context ?? "", /message_end/);
+
+    completions[0]?.resolve(createAssistantResponse("Running command output."));
+    await flushAsyncWork();
+
+    assert.equal(widgets.length, 1);
+    assert.equal(widgets[0], undefined);
+
+    completions[1]?.resolve(createAssistantResponse("Completed the task."));
+    await flushAsyncWork();
+
+    assert.equal(widgets.length, 2);
+    assert.equal(typeof widgets[1], "function");
   });
 
   it("drives a prompt-start summary into the widget", async () => {

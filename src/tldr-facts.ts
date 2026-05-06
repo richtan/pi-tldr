@@ -49,6 +49,11 @@ export function extractTextContent(
   return text || undefined;
 }
 
+function markCurrentActivity(fact: string): string {
+  const [eventLine, ...detailLines] = fact.split("\n");
+  return [eventLine, "currentActivity=true", ...detailLines].join("\n");
+}
+
 function sanitizeFactFields(
   fields: readonly FactField[],
 ): readonly FactField[] {
@@ -235,16 +240,18 @@ export class TldrFactSession {
       const fact = this.activity[index];
       if (!fact) continue;
 
+      const snapshotFact =
+        index === this.activity.length - 1 ? markCurrentActivity(fact) : fact;
       const separatorLength = recentActivity.length === 0 ? 0 : 1;
-      const needed = fact.length + separatorLength;
+      const needed = snapshotFact.length + separatorLength;
       if (needed <= remaining) {
-        recentActivity.unshift(fact);
+        recentActivity.unshift(snapshotFact);
         remaining -= needed;
         continue;
       }
 
       if (recentActivity.length === 0) {
-        recentActivity.unshift(truncateText(fact, remaining));
+        recentActivity.unshift(truncateText(snapshotFact, remaining));
       }
       break;
     }
