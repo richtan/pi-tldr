@@ -96,6 +96,12 @@ Precedence:
 
 If the selected model is unavailable, pi-tldr falls back to `auto`. `/tldr-model reset` removes the saved preference.
 
+## Privacy
+
+pi-tldr sends short snippets from recent prompt, assistant, tool, and result activity to the selected TLDR model provider. This activity is generally already part of the pi agent context, but `auto` may send it to an additional or different provider from your main pi model.
+
+pi-tldr does not attempt to detect or redact secrets. It disables prompt caching for TLDR requests and keeps snippets short, but this is not a security boundary. Do not use pi-tldr where sending these snippets to the TLDR provider is unacceptable.
+
 ## What it does
 
 During a prompt, pi displays a compact box like:

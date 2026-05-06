@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".tmp-test",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["src/tldr-core.ts", "test/**/*.test.ts"]
+}

@@ -21,8 +21,10 @@
   ],
   "scripts": {
     "check": "tsc --noEmit",
-    "format": "prettier --write README.md package.json src/index.ts",
-    "format:check": "prettier --check README.md package.json src/index.ts",
+    "build:test": "node -e \"require('node:fs').rmSync('.tmp-test', { recursive: true, force: true })\" && tsc -p tsconfig.test.json",
+    "test": "npm run build:test && node --test .tmp-test/test/*.test.js",
+    "format": "prettier --write README.md package.json \"tsconfig*.json\" \".github/workflows/*.yml\" \"src/**/*.ts\" \"test/**/*.ts\"",
+    "format:check": "prettier --check README.md package.json \"tsconfig*.json\" \".github/workflows/*.yml\" \"src/**/*.ts\" \"test/**/*.ts\"",
     "pack:dry-run": "npm pack --dry-run"
   },
   "pi": {
