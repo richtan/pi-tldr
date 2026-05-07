@@ -4,6 +4,18 @@ A [pi](https://pi.dev) extension that shows a small live `tldr` box above the in
 
 It summarizes what pi is currently doing and keeps a final result summary visible until the next prompt starts.
 
+## What it does
+
+During a prompt, pi displays a TLDR box like:
+
+```text
+╭ tldr ─────────────────────────────────────────────╮
+│ Inspecting the extension package structure        │
+╰───────────────────────────────────────────────────╯
+```
+
+The TLDR updates as pi works, including during tool calls and final responses.
+
 ## Install
 
 Install globally for all pi projects:
@@ -208,18 +220,6 @@ Upgrade note: older pi-tldr versions used `/tldr-model` and `/tldr-status`. Use 
 pi-tldr sends short snippets from recent prompt, assistant, tool, and result activity to the selected TLDR model provider. This activity is generally already part of the pi agent context, but `auto` may send it to an additional or different provider from your main pi model.
 
 pi-tldr does not attempt to detect or redact secrets. It disables prompt caching for TLDR requests and keeps snippets short, but this is not a security boundary. Do not use pi-tldr where sending these snippets to the TLDR provider is unacceptable. Use `/tldr off` to stop TLDR requests for the current session.
-
-## What it does
-
-During a prompt, pi displays a compact box like:
-
-```text
-╭ tldr ─────────────────────────────────────────────╮
-│ Inspecting the extension package structure        │
-╰───────────────────────────────────────────────────╯
-```
-
-The TLDR updates as pi works, including during tool calls and final responses.
 
 ## License
 
