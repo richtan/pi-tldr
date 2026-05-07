@@ -55,17 +55,20 @@ Show available pi-tldr commands:
 /tldr help
 ```
 
-| Command               | Description                                                                       |
-| --------------------- | --------------------------------------------------------------------------------- |
-| `/tldr status`        | Show enablement, selected model, and active model after auth/fallback resolution. |
-| `/tldr stats`         | Show session-local TLDR latency stats.                                            |
-| `/tldr on`            | Enable TLDRs for the current session.                                             |
-| `/tldr off`           | Disable TLDRs for the current session.                                            |
-| `/tldr toggle`        | Toggle TLDRs for the current session.                                             |
-| `/tldr model`         | Open pi's searchable TLDR model selector UI.                                      |
-| `/tldr model <model>` | Save a supported TLDR model.                                                      |
-| `/tldr model auto`    | Use automatic model selection.                                                    |
-| `/tldr model reset`   | Return to automatic selection and remove the saved preference.                    |
+| Command                 | Description                                                                       |
+| ----------------------- | --------------------------------------------------------------------------------- |
+| `/tldr status`          | Show enablement, selected model, and active model after auth/fallback resolution. |
+| `/tldr stats`           | Show session-local average latency and accepted TLDR count.                       |
+| `/tldr on`              | Enable TLDRs for the current session.                                             |
+| `/tldr off`             | Disable TLDRs for the current session.                                            |
+| `/tldr toggle`          | Toggle TLDRs for the current session.                                             |
+| `/tldr model`           | Open pi's searchable TLDR model selector UI.                                      |
+| `/tldr model <model>`   | Save a supported TLDR model.                                                      |
+| `/tldr model auto`      | Use automatic model selection.                                                    |
+| `/tldr model reset`     | Return to automatic selection and remove the saved preference.                    |
+| `/tldr debug status`    | Show whether debug file logging is enabled and where it writes.                   |
+| `/tldr debug on [path]` | Write raw TLDR model outputs to a local JSONL debug log.                          |
+| `/tldr debug off`       | Stop writing the debug log.                                                       |
 
 ### Choose a TLDR model
 
@@ -146,7 +149,7 @@ active model: anthropic/claude-haiku-4-5
 
 If no supported model is available, the active model is `none`. If auth cannot be checked, the active model is `unknown (auth check failed)`.
 
-Show the average time from a TLDR being triggered to an accepted TLDR widget update being submitted:
+Show the average time from a TLDR being triggered to an accepted TLDR widget update being submitted, plus the accepted TLDR count:
 
 ```text
 /tldr stats
@@ -155,14 +158,48 @@ Show the average time from a TLDR being triggered to an accepted TLDR widget upd
 Example:
 
 ```text
-pi-tldr stats
+pi-tldr session stats
 avg latency: 420ms
-samples: 5
+tldrs: 5
 ```
 
-Before any TLDR update has been accepted in the current session, average latency is `n/a` and samples is `0`.
+Before any TLDR update has been accepted in the current session, average latency is `n/a` and `tldrs` is `0`.
 
-Use this as a practical responsiveness metric for pi-tldr updates.
+Use this as a practical responsiveness metric for pi-tldr updates. For final TLDR troubleshooting, enable `/tldr debug on` and inspect the debug log outcome entries.
+
+### Debug TLDR model output
+
+To inspect exactly what the TLDR model returned, enable a local JSONL debug log:
+
+```text
+/tldr debug on
+```
+
+By default, pi-tldr writes to:
+
+```text
+~/.pi/agent/pi-tldr-debug.jsonl
+```
+
+You can choose a different path:
+
+```text
+/tldr debug on ./pi-tldr-debug.jsonl
+```
+
+Check where logging is writing:
+
+```text
+/tldr debug status
+```
+
+Disable logging when you are done:
+
+```text
+/tldr debug off
+```
+
+Debug entries include metadata such as source, model, stop reason, outcome, accepted status, extracted summary, and the raw TLDR model output. The log is created with user-only file permissions when possible, but it is not redacted and may contain sensitive text copied from session snippets.
 
 Upgrade note: older pi-tldr versions used `/tldr-model` and `/tldr-status`. Use `/tldr model ...` and `/tldr status` instead.
 

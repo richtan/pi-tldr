@@ -5,6 +5,9 @@
  * TLDR output from typed agent lifecycle facts.
  */
 
+import { chmodSync, closeSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
 import {
   complete,
   type ProviderStreamOptions,
@@ -36,15 +39,25 @@ import { extractSummary } from "./tldr-core.js";
 const WIDGET_KEY = "pi-tldr";
 const TITLE = " tldr ";
 const MIN_BOX_WIDTH = 12;
-const MAX_SUMMARY_CHARS = 180;
+const PROMPT_TARGET_SUMMARY_CHARS = 180;
+const MAX_SUMMARY_CHARS = 220;
+const PRIVATE_FILE_MODE = 0o600;
+const PRIVATE_DIRECTORY_MODE = 0o700;
 const LLM_UPDATE_INTERVAL_MS = 1_200;
 const TOOL_ACTIVITY_COALESCE_MS = 300;
 const TLDR_MAX_TOKENS = 80;
-const TLDR_REQUEST_TIMEOUT_MS = 8_000;
+const TLDR_REQUEST_TIMEOUT_MS = 3_000;
+const DEFAULT_DEBUG_LOG_PATH = resolve(
+  homedir(),
+  ".pi",
+  "agent",
+  "pi-tldr-debug.jsonl",
+);
 
 type CompleteFunction = typeof complete;
 type Clock = () => number;
 type TimerHandle = unknown;
+type DebugLogWriter = (filePath: string, line: string) => void;
 
 export interface TldrScheduler {
   setTimeout(callback: () => void, delayMs: number): TimerHandle;
@@ -58,9 +71,22 @@ export interface PiTldrDependencies {
   readonly wallClockNow?: Clock;
   readonly toolActivityCoalesceMs?: number;
   readonly scheduler?: TldrScheduler;
+  readonly debugLogWriter?: DebugLogWriter;
 }
 
 type RefinementUrgency = "now" | "debounced" | "coalesced";
+type RefinementSource = "regular" | "final";
+type FinalTldrOutcome =
+  | "pending"
+  | "accepted"
+  | "cleared"
+  | "unchanged"
+  | "invalid model output"
+  | "incomplete response"
+  | "no available model"
+  | "auth check failed"
+  | "request failed"
+  | "superseded";
 
 interface RuntimeState {
   active: boolean;
@@ -73,9 +99,16 @@ interface RuntimeState {
   lastLlmStart: number;
   latencySamples: number;
   totalLatencyMs: number;
+  finalRequests: number;
+  finalAccepted: number;
+  finalStatsVersion: number;
+  finalRequestSequence: number;
+  latestFinalRequestId?: number;
+  lastFinalOutcome?: FinalTldrOutcome;
   pendingRequest?: RefinementRequest;
   updateTimer?: TimerHandle;
   activeRequest?: AbortController;
+  activeRefinementRequest?: RefinementRequest;
   cachedAuth?: CachedAuth;
   authCacheVersion: number;
   readonly facts: TldrFactSession;
@@ -84,6 +117,8 @@ interface RuntimeState {
   readonly wallClockNow: Clock;
   readonly toolActivityCoalesceMs: number;
   readonly scheduler: TldrScheduler;
+  readonly debugLogWriter: DebugLogWriter;
+  debugLogPath?: string;
 }
 
 interface CachedAuth {
@@ -96,6 +131,9 @@ interface RefinementRequest {
   readonly generation: number;
   readonly refinementGeneration: number;
   readonly triggeredAtMs: number;
+  readonly source: RefinementSource;
+  readonly finalStatsVersion: number;
+  readonly finalRequestId?: number;
 }
 
 interface StatusSnapshot {
@@ -106,7 +144,7 @@ interface StatusSnapshot {
 }
 
 const TLDR_SYSTEM_PROMPT = `You write live status TLDRs for a terminal coding agent.
-Return one short, complete, plain-English sentence.
+Return one short, complete, plain-English sentence under ${PROMPT_TARGET_SUMMARY_CHARS} characters.
 The sentence must be complete and must not trail off.
 Describe what the agent is doing right now for the user's task.
 Prioritize the latest event facts; use earlier facts only as context.
@@ -174,12 +212,29 @@ function createDefaultScheduler(): TldrScheduler {
   };
 }
 
+function createDefaultDebugLogWriter(): DebugLogWriter {
+  return (filePath, line) => {
+    mkdirSync(dirname(filePath), {
+      recursive: true,
+      mode: PRIVATE_DIRECTORY_MODE,
+    });
+    const file = openSync(filePath, "a", PRIVATE_FILE_MODE);
+    try {
+      chmodSync(filePath, PRIVATE_FILE_MODE);
+      writeSync(file, `${line}\n`, undefined, "utf8");
+    } finally {
+      closeSync(file);
+    }
+  };
+}
+
 function createInitialState(
   completeTldr: CompleteFunction,
   latencyNow: Clock,
   wallClockNow: Clock,
   toolActivityCoalesceMs: number,
   scheduler: TldrScheduler,
+  debugLogWriter: DebugLogWriter,
 ): RuntimeState {
   return {
     active: false,
@@ -191,6 +246,10 @@ function createInitialState(
     lastLlmStart: Number.NEGATIVE_INFINITY,
     latencySamples: 0,
     totalLatencyMs: 0,
+    finalRequests: 0,
+    finalAccepted: 0,
+    finalStatsVersion: 0,
+    finalRequestSequence: 0,
     authCacheVersion: 0,
     facts: new TldrFactSession(),
     complete: completeTldr,
@@ -198,6 +257,7 @@ function createInitialState(
     wallClockNow,
     toolActivityCoalesceMs,
     scheduler,
+    debugLogWriter,
   };
 }
 
@@ -314,15 +374,87 @@ function notifyTldrHelp(ctx: ExtensionContext): void {
       "pi-tldr commands",
       "/tldr help - show this help",
       "/tldr status - show enabled and model status",
-      "/tldr stats - show session latency stats",
+      "/tldr stats - show latency and TLDR count",
       "/tldr on - enable TLDRs for this session",
       "/tldr off - disable TLDRs for this session",
       "/tldr toggle - toggle TLDRs for this session",
       "/tldr model - choose the TLDR model",
       "/tldr model <model|auto|reset> - set the TLDR model",
+      "/tldr debug status - show debug log status",
+      "/tldr debug on [path] - write raw TLDR outputs to a JSONL log",
+      "/tldr debug off - stop writing the debug log",
     ].join("\n"),
     "info",
   );
+}
+
+function resolveDebugLogPath(rawPath?: string): string {
+  const trimmedPath = rawPath?.trim();
+  if (!trimmedPath) return DEFAULT_DEBUG_LOG_PATH;
+  if (trimmedPath === "~") return homedir();
+  if (trimmedPath.startsWith("~/")) {
+    return resolve(homedir(), trimmedPath.slice(2));
+  }
+  return resolve(trimmedPath);
+}
+
+function formatDebugStatus(state: RuntimeState): string {
+  return [
+    "pi-tldr debug",
+    `file logging: ${state.debugLogPath ? "on" : "off"}`,
+    ...(state.debugLogPath ? [`path: ${state.debugLogPath}`] : []),
+  ].join("\n");
+}
+
+function notifyTldrDebugStatus(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+): void {
+  notifyUser(ctx, formatDebugStatus(state), "info");
+}
+
+function setDebugLogging(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  rawPath?: string,
+): void {
+  state.debugLogPath = resolveDebugLogPath(rawPath);
+  notifyUser(
+    ctx,
+    [
+      "pi-tldr debug file logging enabled",
+      `path: ${state.debugLogPath}`,
+      "warning: this log may contain TLDR model output copied from session snippets; pi-tldr does not redact secrets",
+    ].join("\n"),
+    "info",
+  );
+}
+
+function clearDebugLogging(ctx: ExtensionContext, state: RuntimeState): void {
+  state.debugLogPath = undefined;
+  notifyUser(ctx, "pi-tldr debug file logging disabled", "info");
+}
+
+function handleDebugCommand(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  args: readonly string[],
+): void {
+  const subcommand = args[0]?.toLowerCase() ?? "status";
+  if (["status", "show"].includes(subcommand)) {
+    notifyTldrDebugStatus(ctx, state);
+    return;
+  }
+  if (["on", "enable", "enabled"].includes(subcommand)) {
+    setDebugLogging(ctx, state, args.slice(1).join(" "));
+    return;
+  }
+  if (["off", "disable", "disabled"].includes(subcommand)) {
+    clearDebugLogging(ctx, state);
+    return;
+  }
+
+  notifyUser(ctx, "Use /tldr debug [status|on [path]|off]", "error");
 }
 
 function formatLatencyStats(state: RuntimeState): string {
@@ -331,14 +463,47 @@ function formatLatencyStats(state: RuntimeState): string {
     : "n/a";
 
   return [
-    "pi-tldr stats",
+    "pi-tldr session stats",
     `avg latency: ${averageLatency}`,
-    `samples: ${state.latencySamples}`,
+    `tldrs: ${state.latencySamples}`,
   ].join("\n");
 }
 
 function notifyTldrStats(ctx: ExtensionContext, state: RuntimeState): void {
   notifyUser(ctx, formatLatencyStats(state), "info");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function writeDebugLog(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  entry: Record<string, unknown>,
+): void {
+  if (!state.debugLogPath) return;
+
+  const filePath = state.debugLogPath;
+  const line = JSON.stringify({
+    timestamp: new Date(state.wallClockNow()).toISOString(),
+    ...entry,
+  });
+
+  try {
+    state.debugLogWriter(filePath, line);
+  } catch (error) {
+    state.debugLogPath = undefined;
+    notifyUser(
+      ctx,
+      [
+        "pi-tldr debug file logging disabled after write failure",
+        `path: ${filePath}`,
+        `error: ${errorMessage(error)}`,
+      ].join("\n"),
+      "error",
+    );
+  }
 }
 
 function setTldrEnabled(
@@ -383,11 +548,20 @@ function resetRunState(state: RuntimeState, prompt?: string): void {
 function resetLatencyStats(state: RuntimeState): void {
   state.latencySamples = 0;
   state.totalLatencyMs = 0;
+  state.finalRequests = 0;
+  state.finalAccepted = 0;
+  state.finalStatsVersion++;
+  state.latestFinalRequestId = undefined;
+  state.lastFinalOutcome = undefined;
 }
 
 function clearCachedAuth(state: RuntimeState): void {
   state.authCacheVersion++;
   state.cachedAuth = undefined;
+}
+
+function acceptsActivity(state: RuntimeState): boolean {
+  return state.active && state.enabled;
 }
 
 function createCompletionOptions(
@@ -407,15 +581,35 @@ function createCompletionOptions(
   return options;
 }
 
+function clearActiveRefinementRequest(
+  state: RuntimeState,
+  request: RefinementRequest,
+): void {
+  if (state.activeRefinementRequest === request) {
+    state.activeRefinementRequest = undefined;
+  }
+}
+
+function recordSupersededFinalWork(state: RuntimeState): void {
+  if (state.pendingRequest) {
+    recordFinalOutcome(state, state.pendingRequest, "superseded");
+  }
+  if (state.activeRefinementRequest) {
+    recordFinalOutcome(state, state.activeRefinementRequest, "superseded");
+  }
+}
+
 function clearPendingWork(state: RuntimeState): void {
   state.refinementGeneration++;
   if (state.updateTimer !== undefined) {
     state.scheduler.clearTimeout(state.updateTimer);
   }
+  recordSupersededFinalWork(state);
   state.updateTimer = undefined;
   state.pendingRequest = undefined;
   state.activeRequest?.abort();
   state.activeRequest = undefined;
+  state.activeRefinementRequest = undefined;
 }
 
 function isCurrent(state: RuntimeState, request: RefinementRequest): boolean {
@@ -425,6 +619,34 @@ function isCurrent(state: RuntimeState, request: RefinementRequest): boolean {
     request.generation === state.generation &&
     request.refinementGeneration === state.refinementGeneration
   );
+}
+
+function beginFinalRequest(state: RuntimeState): number {
+  state.finalRequests++;
+  state.finalRequestSequence++;
+  state.latestFinalRequestId = state.finalRequestSequence;
+  state.lastFinalOutcome = "pending";
+  return state.finalRequestSequence;
+}
+
+function clearLatestFinalRequest(state: RuntimeState): void {
+  state.latestFinalRequestId = undefined;
+}
+
+function recordFinalOutcome(
+  state: RuntimeState,
+  request: RefinementRequest,
+  outcome: FinalTldrOutcome,
+): void {
+  if (
+    request.source !== "final" ||
+    request.finalStatsVersion !== state.finalStatsVersion ||
+    request.finalRequestId !== state.latestFinalRequestId
+  ) {
+    return;
+  }
+  if (outcome === "accepted") state.finalAccepted++;
+  state.lastFinalOutcome = outcome;
 }
 
 function renderSummary(
@@ -451,11 +673,22 @@ function requestRefinement(
   ctx: ExtensionContext,
   state: RuntimeState,
   urgency: RefinementUrgency,
+  source: RefinementSource = "regular",
 ): void {
-  if (!ctx.hasUI || !state.enabled) return;
+  if (!ctx.hasUI || !acceptsActivity(state)) return;
 
   const facts = state.facts.snapshot();
-  if (!facts || facts === state.lastFacts) return;
+  if (!facts) return;
+
+  if (facts === state.lastFacts) {
+    if (source === "final") state.lastFinalOutcome = "unchanged";
+    return;
+  }
+
+  recordSupersededFinalWork(state);
+
+  let finalRequestId: number | undefined;
+  if (source === "final") finalRequestId = beginFinalRequest(state);
 
   state.lastFacts = facts;
   state.refinementGeneration++;
@@ -464,9 +697,13 @@ function requestRefinement(
     generation: state.generation,
     refinementGeneration: state.refinementGeneration,
     triggeredAtMs: state.latencyNow(),
+    source,
+    finalStatsVersion: state.finalStatsVersion,
+    finalRequestId,
   };
   state.activeRequest?.abort();
   state.activeRequest = undefined;
+  state.activeRefinementRequest = undefined;
 
   if (state.updateTimer !== undefined) {
     state.scheduler.clearTimeout(state.updateTimer);
@@ -538,16 +775,46 @@ async function generateSummary(
   state: RuntimeState,
   request: RefinementRequest,
 ): Promise<void> {
-  if (!isCurrent(state, request)) return;
+  if (!isCurrent(state, request)) {
+    recordFinalOutcome(state, request, "superseded");
+    return;
+  }
+
+  state.activeRefinementRequest = request;
 
   let auth: FastModelAuth | undefined;
   try {
     auth = await resolveTldrAuth(ctx, state, request);
-  } catch {
+  } catch (error) {
     clearCachedAuth(state);
+    const outcome = isCurrent(state, request)
+      ? "auth check failed"
+      : "superseded";
+    writeDebugLog(ctx, state, {
+      source: request.source,
+      outcome,
+      accepted: false,
+      error: errorMessage(error),
+    });
+    recordFinalOutcome(state, request, outcome);
+    clearActiveRefinementRequest(state, request);
     return;
   }
-  if (!auth || !isCurrent(state, request)) return;
+  if (!isCurrent(state, request)) {
+    recordFinalOutcome(state, request, "superseded");
+    clearActiveRefinementRequest(state, request);
+    return;
+  }
+  if (!auth) {
+    writeDebugLog(ctx, state, {
+      source: request.source,
+      outcome: "no available model",
+      accepted: false,
+    });
+    recordFinalOutcome(state, request, "no available model");
+    clearActiveRefinementRequest(state, request);
+    return;
+  }
 
   const abortController = new AbortController();
   state.activeRequest = abortController;
@@ -569,23 +836,85 @@ async function generateSummary(
       { systemPrompt: TLDR_SYSTEM_PROMPT, messages: [message] },
       createCompletionOptions(auth, abortController.signal),
     );
-    if (!isCurrent(state, request)) return;
-    if (response.stopReason !== "stop") {
-      if (response.stopReason === "error") clearCachedAuth(state);
+    if (!isCurrent(state, request)) {
+      recordFinalOutcome(state, request, "superseded");
       return;
     }
 
     const responseText = extractTextContent(response.content) ?? "";
-    const summary = extractSummary(responseText, MAX_SUMMARY_CHARS);
-    if (summary && renderSummary(ctx, state, summary)) {
-      recordLatency(state, request);
+    if (response.stopReason !== "stop") {
+      if (response.stopReason === "error") clearCachedAuth(state);
+      writeDebugLog(ctx, state, {
+        source: request.source,
+        model: formatAuthModelKey(auth),
+        outcome: "incomplete response",
+        accepted: false,
+        stopReason: response.stopReason,
+        rawOutput: responseText,
+      });
+      recordFinalOutcome(state, request, "incomplete response");
+      return;
     }
-  } catch {
+
+    const summary = extractSummary(responseText, MAX_SUMMARY_CHARS);
+    if (!summary) {
+      writeDebugLog(ctx, state, {
+        source: request.source,
+        model: formatAuthModelKey(auth),
+        outcome: "invalid model output",
+        accepted: false,
+        stopReason: response.stopReason,
+        rawOutput: responseText,
+      });
+      recordFinalOutcome(state, request, "invalid model output");
+      return;
+    }
+
+    if (!renderSummary(ctx, state, summary)) {
+      writeDebugLog(ctx, state, {
+        source: request.source,
+        model: formatAuthModelKey(auth),
+        outcome: "unchanged",
+        accepted: false,
+        stopReason: response.stopReason,
+        rawOutput: responseText,
+        summary,
+      });
+      recordFinalOutcome(state, request, "unchanged");
+      return;
+    }
+
+    writeDebugLog(ctx, state, {
+      source: request.source,
+      model: formatAuthModelKey(auth),
+      outcome: "accepted",
+      accepted: true,
+      stopReason: response.stopReason,
+      rawOutput: responseText,
+      summary,
+    });
+    recordLatency(state, request);
+    recordFinalOutcome(state, request, "accepted");
+  } catch (error) {
     if (!abortController.signal.aborted) clearCachedAuth(state);
+    const outcome = abortController.signal.aborted
+      ? "superseded"
+      : "request failed";
+    writeDebugLog(ctx, state, {
+      source: request.source,
+      model: formatAuthModelKey(auth),
+      outcome,
+      accepted: false,
+      aborted: abortController.signal.aborted,
+      error: errorMessage(error),
+    });
+    recordFinalOutcome(state, request, outcome);
     // TLDR refinement is optional; keep the previous accepted TLDR on failure.
   } finally {
-    if (state.activeRequest === abortController)
+    if (state.activeRequest === abortController) {
       state.activeRequest = undefined;
+      state.activeRefinementRequest = undefined;
+    }
   }
 }
 
@@ -601,6 +930,8 @@ export function createPiTldr(
     dependencies.toolActivityCoalesceMs ?? TOOL_ACTIVITY_COALESCE_MS,
   );
   const scheduler = dependencies.scheduler ?? createDefaultScheduler();
+  const debugLogWriter =
+    dependencies.debugLogWriter ?? createDefaultDebugLogWriter();
 
   return (pi: ExtensionAPI): void => {
     pi.registerFlag(TLDR_MODEL_FLAG, {
@@ -615,6 +946,7 @@ export function createPiTldr(
       wallClockNow,
       toolActivityCoalesceMs,
       scheduler,
+      debugLogWriter,
     );
 
     pi.registerCommand("tldr", {
@@ -641,6 +973,11 @@ export function createPiTldr(
 
         if (normalizedAction === "stats") {
           notifyTldrStats(ctx, state);
+          return;
+        }
+
+        if (normalizedAction === "debug") {
+          handleDebugCommand(ctx, state, rest);
           return;
         }
 
@@ -685,7 +1022,7 @@ export function createPiTldr(
 
         notifyUser(
           ctx,
-          "Use /tldr [help|status|stats|on|off|toggle|model <model>]",
+          "Use /tldr [help|status|stats|debug|on|off|toggle|model <model>]",
           "error",
         );
       },
@@ -714,6 +1051,7 @@ export function createPiTldr(
     });
 
     pi.on("before_agent_start", (event, ctx) => {
+      if (!state.active) return;
       state.generation++;
       resetRunState(state, state.enabled ? event.prompt : undefined);
       clearWidget(ctx);
@@ -721,37 +1059,39 @@ export function createPiTldr(
     });
 
     pi.on("message_update", (event, ctx) => {
-      if (!state.enabled) return;
+      if (!acceptsActivity(state)) return;
       if (!state.facts.recordAssistantUpdate(event.message)) return;
       requestRefinement(ctx, state, "debounced");
     });
 
     pi.on("tool_call", (event, ctx) => {
-      if (!state.enabled) return;
+      if (!acceptsActivity(state)) return;
       state.facts.recordToolCall(event);
       requestRefinement(ctx, state, "coalesced");
     });
 
     pi.on("tool_result", (event, ctx) => {
-      if (!state.enabled) return;
+      if (!acceptsActivity(state)) return;
       state.facts.recordToolResult(event);
       requestRefinement(ctx, state, "coalesced");
     });
 
     pi.on("message_end", (event, ctx) => {
-      if (!state.enabled) return;
+      if (!acceptsActivity(state)) return;
       const result = state.facts.recordMessageEnd(event.message);
       if (result === "ignored") return;
 
       if (result === "emptyFinalStop") {
         clearPendingWork(state);
+        clearLatestFinalRequest(state);
+        state.lastFinalOutcome = "cleared";
         state.currentSummary = "";
         state.lastFacts = "";
         clearWidget(ctx);
         return;
       }
 
-      requestRefinement(ctx, state, "now");
+      requestRefinement(ctx, state, "now", "final");
     });
   };
 }

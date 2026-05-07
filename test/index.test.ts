@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import type {
   Api,
@@ -285,12 +288,15 @@ describe("piTldr extension entrypoint", () => {
           "pi-tldr commands",
           "/tldr help - show this help",
           "/tldr status - show enabled and model status",
-          "/tldr stats - show session latency stats",
+          "/tldr stats - show latency and TLDR count",
           "/tldr on - enable TLDRs for this session",
           "/tldr off - disable TLDRs for this session",
           "/tldr toggle - toggle TLDRs for this session",
           "/tldr model - choose the TLDR model",
           "/tldr model <model|auto|reset> - set the TLDR model",
+          "/tldr debug status - show debug log status",
+          "/tldr debug on [path] - write raw TLDR outputs to a JSONL log",
+          "/tldr debug off - stop writing the debug log",
         ].join("\n"),
       },
     ]);
@@ -453,6 +459,7 @@ describe("piTldr extension entrypoint", () => {
     const extension = createPiTldr({
       preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
+      latencyNow: () => 0,
       complete: async () => {
         completionCalls++;
         return createAssistantResponse(`Summarized step ${completionCalls}.`);
@@ -491,6 +498,7 @@ describe("piTldr extension entrypoint", () => {
     const extension = createPiTldr({
       preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
+      latencyNow: () => 0,
       complete: async () => createAssistantResponse("Updated current status."),
     });
     const ctx = createFakeContext({
@@ -525,6 +533,7 @@ describe("piTldr extension entrypoint", () => {
     const extension = createPiTldr({
       preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
+      latencyNow: () => 0,
       complete: async () => {
         completionCalls++;
         if (completionCalls === 1) throw new Error("provider failed");
@@ -563,6 +572,7 @@ describe("piTldr extension entrypoint", () => {
     const extension = createPiTldr({
       preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
+      latencyNow: () => 0,
       complete: async () => {
         completionCalls++;
         return completionCalls === 1
@@ -602,6 +612,7 @@ describe("piTldr extension entrypoint", () => {
     const extension = createPiTldr({
       preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
+      latencyNow: () => 0,
       complete: async () => createAssistantResponse("Summarized status."),
     });
     const ctx = createFakeContext({
@@ -647,6 +658,7 @@ describe("piTldr extension entrypoint", () => {
     const extension = createPiTldr({
       preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
+      latencyNow: () => 0,
       complete: async (_model, _context, options) => {
         completionKeys.push(options?.apiKey ?? "");
         return createAssistantResponse("Summarized latest status.");
@@ -698,6 +710,7 @@ describe("piTldr extension entrypoint", () => {
     const extension = createPiTldr({
       preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
+      latencyNow: () => 0,
       complete: async (model, _context, options) => {
         completionModels.push(
           `${model.provider}/${model.id}:${options?.apiKey}`,
@@ -742,6 +755,7 @@ describe("piTldr extension entrypoint", () => {
     const extension = createPiTldr({
       preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
+      latencyNow: () => 0,
       complete: async (model, _context, options) => {
         completionModels.push(
           `${model.provider}/${model.id}:${options?.apiKey}`,
@@ -785,6 +799,7 @@ describe("piTldr extension entrypoint", () => {
     const extension = createPiTldr({
       preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
+      latencyNow: () => 0,
       complete: async (_model, _context, options) => {
         completionKeys.push(options?.apiKey ?? "");
         return createAssistantResponse("Summarized current status.");
@@ -862,7 +877,9 @@ describe("piTldr extension entrypoint", () => {
     assert.deepEqual(notifications, [
       {
         level: "info",
-        message: ["pi-tldr stats", "avg latency: n/a", "samples: 0"].join("\n"),
+        message: ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join(
+          "\n",
+        ),
       },
     ]);
   });
@@ -902,7 +919,7 @@ describe("piTldr extension entrypoint", () => {
 
     assert.equal(
       notifications.at(-1)?.message,
-      ["pi-tldr stats", "avg latency: 350ms", "samples: 2"].join("\n"),
+      ["pi-tldr session stats", "avg latency: 350ms", "tldrs: 2"].join("\n"),
     );
   });
 
@@ -931,7 +948,7 @@ describe("piTldr extension entrypoint", () => {
 
     assert.equal(
       notifications.at(-1)?.message,
-      ["pi-tldr stats", "avg latency: 125ms", "samples: 1"].join("\n"),
+      ["pi-tldr session stats", "avg latency: 125ms", "tldrs: 1"].join("\n"),
     );
 
     events.get("session_start")?.({}, ctx);
@@ -939,7 +956,750 @@ describe("piTldr extension entrypoint", () => {
 
     assert.equal(
       notifications.at(-1)?.message,
-      ["pi-tldr stats", "avg latency: n/a", "samples: 0"].join("\n"),
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("reports accepted final TLDR stats", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        createAssistantResponse("Completed the requested task."),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
+    );
+  });
+
+  it("writes raw TLDR model output to the debug log", async () => {
+    const scheduler = new FakeScheduler();
+    const logLines: string[] = [];
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      wallClockNow: () => Date.parse("2026-05-06T12:00:00.000Z"),
+      debugLogWriter: (_filePath, line) => {
+        logLines.push(line);
+      },
+      complete: async () =>
+        createAssistantResponse("**Finished updating tests.**\nExtra detail."),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("debug on ./tldr-debug.jsonl", ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(logLines.length, 1);
+    assert.deepEqual(JSON.parse(logLines[0] ?? "{}"), {
+      timestamp: "2026-05-06T12:00:00.000Z",
+      source: "final",
+      model: "anthropic/claude-haiku-4-5",
+      outcome: "invalid model output",
+      accepted: false,
+      stopReason: "stop",
+      rawOutput: "**Finished updating tests.**\nExtra detail.",
+    });
+  });
+
+  it("creates debug log files with private permissions", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "pi-tldr-test-"));
+    try {
+      const scheduler = new FakeScheduler();
+      const logPath = join(tempDir, "pi-tldr-debug.jsonl");
+      const { pi, commands, events } = createFakePiHarness();
+      const extension = createPiTldr({
+        preferredModelStore: createMemoryPreferredModelStore(),
+        scheduler,
+        latencyNow: () => 0,
+        complete: async () => createAssistantResponse("Checking status."),
+      });
+      const ctx = createFakeContext({});
+
+      extension(pi);
+      events.get("session_start")?.({}, ctx);
+      await commands.get("tldr")?.handler(`debug on ${logPath}`, ctx);
+      events.get("message_update")?.(
+        { message: createAssistantResponse("Working on the task.") },
+        ctx,
+      );
+      scheduler.advanceBy(0);
+      await flushAsyncWork();
+
+      assert.equal(statSync(logPath).mode & 0o777, 0o600);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("disables debug logging after write failures", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      debugLogWriter: () => {
+        throw new Error("disk full");
+      },
+      complete: async () => createAssistantResponse("Checking status."),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    await commands.get("tldr")?.handler("debug on ./tldr-debug.jsonl", ctx);
+    events.get("message_update")?.(
+      { message: createAssistantResponse("Working on the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("debug status", ctx);
+
+    assert.equal(
+      notifications.at(-2)?.message,
+      [
+        "pi-tldr debug file logging disabled after write failure",
+        `path: ${resolve("./tldr-debug.jsonl")}`,
+        "error: disk full",
+      ].join("\n"),
+    );
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr debug", "file logging: off"].join("\n"),
+    );
+  });
+
+  it("accepts clean final TLDR output above the prompt target but within the hard limit", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const cleanLongSummary =
+      "Completed an explanation of major computer science figures and their contributions, organized by foundational areas including pioneers of mechanical computing, mathematical logic, and theoretical computation.";
+    assert(cleanLongSummary.length > 180);
+    assert(cleanLongSummary.length <= 220);
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () => createAssistantResponse(cleanLongSummary),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
+    );
+  });
+
+  it("reports invalid final TLDR model output", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        createAssistantResponse("- Completed the requested task."),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("reports when final TLDR has no available model", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+    });
+    const ctx = createFakeContext({ notifications, auth: { ok: false } });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("reports pending final TLDR attempts", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        createAssistantResponse("Completed the requested task."),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("reports final TLDR auth check failures", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+    });
+    const ctx = createFakeContext({
+      notifications,
+      auth: () => {
+        throw new Error("auth failed");
+      },
+    });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("reports incomplete final TLDR responses", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        createAssistantResponse("Completed the requested task.", "length"),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("reports final TLDR request failures", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () => {
+        throw new Error("request failed");
+      },
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("reports cleared empty final TLDRs", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.({ message: createAssistantResponse("") }, ctx);
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("reports unchanged final TLDR facts", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        createAssistantResponse("Completed the requested task."),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
+    );
+  });
+
+  it("reports duplicate final summaries", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        createAssistantResponse("Completed the requested task."),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Do the task" }, ctx);
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
+    );
+  });
+
+  it("reports stale final TLDRs canceled before they start", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        createAssistantResponse("Completed the requested task."),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    events.get("before_agent_start")?.({ prompt: "Start another task" }, ctx);
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("does not let stale final TLDRs overwrite newer final outcomes", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const completions: Array<{
+      readonly resolve: (
+        response: ReturnType<typeof createAssistantResponse>,
+      ) => void;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        new Promise<ReturnType<typeof createAssistantResponse>>((resolve) => {
+          completions.push({ resolve });
+        }),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("First final text.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Second final text.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 2);
+
+    completions[1]?.resolve(
+      createAssistantResponse("Completed the newer task."),
+    );
+    await flushAsyncWork();
+    completions[0]?.resolve(
+      createAssistantResponse("Completed the older task."),
+    );
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
+    );
+  });
+
+  it("reports active final TLDRs as stale when canceled", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () => new Promise(() => undefined),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    events.get("before_agent_start")?.({ prompt: "Start another task" }, ctx);
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("reports active final TLDRs as stale when superseded by regular work", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () => new Promise(() => undefined),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands
+      .get("tldr")
+      ?.handler("model anthropic/claude-haiku-4-5", ctx);
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("does not let duplicate final facts hide an accepted in-flight final", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    let resolveFinal:
+      | ((response: ReturnType<typeof createAssistantResponse>) => void)
+      | undefined;
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        new Promise<ReturnType<typeof createAssistantResponse>>((resolve) => {
+          resolveFinal = resolve;
+        }),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    resolveFinal?.(createAssistantResponse("Completed the requested task."));
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
+    );
+  });
+
+  it("ignores late final messages after session shutdown", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    let completions = 0;
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () => {
+        completions++;
+        return createAssistantResponse("Completed the requested task.");
+      },
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("session_shutdown")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Late final after shutdown.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(completions, 0);
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
+    );
+  });
+
+  it("keeps cleared as the last final outcome after canceling active final work", async () => {
+    const scheduler = new FakeScheduler();
+    const notifications: Array<{
+      readonly message: string;
+      readonly level: string;
+    }> = [];
+    let rejectFinal: ((error: Error) => void) | undefined;
+    const { pi, commands, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      preferredModelStore: createMemoryPreferredModelStore(),
+      scheduler,
+      latencyNow: () => 0,
+      complete: async () =>
+        new Promise<ReturnType<typeof createAssistantResponse>>(
+          (_resolve, reject) => {
+            rejectFinal = reject;
+          },
+        ),
+    });
+    const ctx = createFakeContext({ notifications });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("message_end")?.(
+      { message: createAssistantResponse("Done with the task.") },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+    events.get("message_end")?.({ message: createAssistantResponse("") }, ctx);
+    rejectFinal?.(new Error("aborted after clear"));
+    await flushAsyncWork();
+    await commands.get("tldr")?.handler("stats", ctx);
+
+    assert.equal(
+      notifications.at(-1)?.message,
+      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
     );
   });
 
@@ -952,6 +1712,7 @@ describe("piTldr extension entrypoint", () => {
       preferredModelStore: createMemoryPreferredModelStore(),
       toolActivityCoalesceMs: 20,
       scheduler,
+      latencyNow: () => 0,
       complete: async (_model, context) => {
         completionPayloads.push(JSON.stringify(context));
         systemPrompts.push(context.systemPrompt ?? "");
@@ -1007,6 +1768,7 @@ describe("piTldr extension entrypoint", () => {
       preferredModelStore: createMemoryPreferredModelStore(),
       toolActivityCoalesceMs: 50,
       scheduler,
+      latencyNow: () => 0,
       complete: async (_model, context) => {
         completionPayloads.push(JSON.stringify(context));
         return createAssistantResponse("Completed the requested change.");
@@ -1062,6 +1824,7 @@ describe("piTldr extension entrypoint", () => {
       preferredModelStore: createMemoryPreferredModelStore(),
       toolActivityCoalesceMs: 20,
       scheduler,
+      latencyNow: () => 0,
       complete: async (_model, context, options) =>
         new Promise<ReturnType<typeof createAssistantResponse>>((resolve) => {
           completions.push({
@@ -1134,7 +1897,7 @@ describe("piTldr extension entrypoint", () => {
 
     assert.equal(completeCalls.length, 1);
     assert.equal(completeCalls[0]?.options?.cacheRetention, "none");
-    assert.equal(completeCalls[0]?.options?.timeoutMs, 8_000);
+    assert.equal(completeCalls[0]?.options?.timeoutMs, 3_000);
     assert.equal(widgets.length, 3);
     assert.equal(widgets[0], undefined);
     assert.equal(widgets[1], undefined);
@@ -1266,7 +2029,8 @@ describe("piTldr extension entrypoint", () => {
       ].join("\n"),
     );
     assert.deepEqual(notifications.at(-1), {
-      message: "Use /tldr [help|status|stats|on|off|toggle|model <model>]",
+      message:
+        "Use /tldr [help|status|stats|debug|on|off|toggle|model <model>]",
       level: "error",
     });
   });
