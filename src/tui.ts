@@ -5,12 +5,13 @@
  * and small helpers for showing, clearing, and notifying through pi's extension
  * UI context.
  */
-import { ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 import {
-  Component,
+  truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 
 const WIDGET_KEY = "pi-tldr";
 const TITLE = " tldr ";
@@ -38,7 +39,7 @@ class PiTldrBox implements Component {
   /** Renders the TLDR into a bordered, width-aware widget. */
   render(width: number): string[] {
     if (width < MIN_BOX_WIDTH) {
-      return [`${TITLE.trim()}: ${this.tldr}`];
+      return [truncateToWidth(`${TITLE.trim()}: ${this.tldr}`, width)];
     }
 
     const contentWidth = width - 4;

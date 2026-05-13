@@ -8,13 +8,16 @@
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 import { describe, it } from "node:test";
-import { Api, Model, ProviderStreamOptions } from "@mariozechner/pi-ai";
-import { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { Api, Model, ProviderStreamOptions } from "@earendil-works/pi-ai";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   createPiTldr,
   piTldr,
-  PiTldrDependencies,
-  TimerScheduler,
+  type PiTldrDependencies,
+  type TimerScheduler,
 } from "../src/index.js";
 import {
   assistantResponse,

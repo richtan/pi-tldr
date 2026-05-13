@@ -8,7 +8,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Api, AssistantMessage, Model } from "@mariozechner/pi-ai";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 
 /** Creates model metadata used by pi-tldr tests. */
 export function fakeModel(

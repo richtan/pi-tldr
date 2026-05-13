@@ -6,8 +6,11 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { AgentMessage } from "@mariozechner/pi-agent-core";
-import { ToolCallEvent, ToolResultEvent } from "@mariozechner/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type {
+  ToolCallEvent,
+  ToolResultEvent,
+} from "@earendil-works/pi-coding-agent";
 import { extractTextContent, TldrFactCollector } from "../src/facts.js";
 
 function assistantMessage(

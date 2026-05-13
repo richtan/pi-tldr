@@ -7,15 +7,19 @@
  * Leaf modules handle fact extraction, model lookup, text extraction, and TUI
  * drawing; the event-to-TLDR flow stays here.
  */
-import { complete, UserMessage } from "@mariozechner/pi-ai";
-import { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { complete } from "@earendil-works/pi-ai";
+import type { UserMessage } from "@earendil-works/pi-ai";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { extractTextContent, TldrFactCollector } from "./facts.js";
 import {
   formatAuthModelKey,
   formatModelPreference,
   getFastModelAuth,
   resolveInitialModelPreference,
-  TldrModelPreference,
+  type TldrModelPreference,
 } from "./models.js";
 import { clearWidget, notifyUser, showWidget } from "./tui.js";
 

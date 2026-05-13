@@ -5,11 +5,9 @@
  * preferences, and selects the first authenticated fast model that can generate
  * live TLDRs.
  */
-import { Api, Model } from "@mariozechner/pi-ai";
-import {
-  ExtensionContext,
-  SettingsManager,
-} from "@mariozechner/pi-coding-agent";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
 
 const SETTINGS_KEY = "pi-tldr";
 

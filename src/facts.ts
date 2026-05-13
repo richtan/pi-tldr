@@ -5,13 +5,16 @@
  * into readable context for the TLDR model. It intentionally avoids sanitizing,
  * truncating, normalizing, scoring, or validating text.
  */
-import { AgentMessage } from "@mariozechner/pi-agent-core";
-import {
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type {
   AssistantMessage,
   ImageContent,
   TextContent,
-} from "@mariozechner/pi-ai";
-import { ToolCallEvent, ToolResultEvent } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-ai";
+import type {
+  ToolCallEvent,
+  ToolResultEvent,
+} from "@earendil-works/pi-coding-agent";
 
 type TextSourceContent =
   | AssistantMessage["content"][number]

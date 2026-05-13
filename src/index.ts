@@ -5,8 +5,8 @@
  * `createPiTldr` constructor that wires production dependencies into the
  * extension registration layer.
  */
-import { complete } from "@mariozechner/pi-ai";
-import { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { complete } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createDefaultTimerScheduler,
   createTldrState,
