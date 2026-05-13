@@ -1,20 +1,26 @@
+/**
+ * @fileoverview Integration-style tests for the pi-tldr extension entry point.
+ *
+ * These tests exercise command handling, lifecycle reset behavior, model auth
+ * fallback, TLDR request scheduling, stale-work cancellation, and widget updates
+ * through a fake pi extension runtime.
+ */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { rmSync } from "node:fs";
 import { describe, it } from "node:test";
-import type {
-  Api,
-  AssistantMessage,
-  Model,
-  ProviderStreamOptions,
-} from "@mariozechner/pi-ai";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
-import { createPiTldr, piTldr, type TldrScheduler } from "../src/index.js";
-import type { PreferredModelStore } from "../src/tldr-models.js";
+import { Api, Model, ProviderStreamOptions } from "@mariozechner/pi-ai";
+import { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import {
+  createPiTldr,
+  piTldr,
+  PiTldrDependencies,
+  TimerScheduler,
+} from "../src/index.js";
+import {
+  assistantResponse,
+  createSettingsCwd,
+  fakeModel,
+} from "./support/helpers.js";
 
 type EventHandler = (
   event: Record<string, unknown>,
@@ -35,98 +41,48 @@ interface FakePiHarness {
   readonly events: Map<string, EventHandler>;
 }
 
-function createFakeModel(
-  provider = "anthropic",
-  id = "claude-haiku-4-5",
-): Model<Api> {
-  return {
-    provider,
-    id,
-    api: "openai-completions",
-    name: id,
-    baseUrl: "https://example.test",
-    reasoning: false,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 1_000,
-    maxTokens: 100,
-  } as Model<Api>;
-}
-
-function createAssistantResponse(
-  text: string,
-  stopReason: AssistantMessage["stopReason"] = "stop",
-): AssistantMessage {
-  return {
-    role: "assistant",
-    content: [{ type: "text", text }],
-    stopReason,
-    timestamp: Date.now(),
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-  } as AssistantMessage;
-}
-
-function createMemoryPreferredModelStore(): PreferredModelStore {
-  let savedModel: string | undefined;
-  return {
-    load() {
-      return savedModel;
-    },
-    save(modelSpec) {
-      savedModel = modelSpec;
-      return undefined;
-    },
-    clear() {
-      savedModel = undefined;
-      return undefined;
-    },
-  };
-}
-
 function createFakePiHarness(): FakePiHarness {
   const commands = new Map<string, RegisteredCommand>();
   const events = new Map<string, EventHandler>();
+  // Safe: the harness implements the ExtensionAPI members used by pi-tldr.
   const pi = {
-    registerFlag() {},
     registerCommand(name: string, command: RegisteredCommand) {
       commands.set(name, command);
     },
     on(name: string, handler: EventHandler) {
       events.set(name, handler);
     },
-    getFlag() {
-      return undefined;
-    },
   } as unknown as ExtensionAPI;
 
   return { pi, commands, events };
 }
 
-type FakeAuthResult = { readonly ok: boolean; readonly apiKey?: string };
+interface FakeAuthResult {
+  readonly ok: boolean;
+  readonly apiKey?: string;
+}
 type FakeAuthProvider = (
   model: Model<Api>,
 ) => Promise<FakeAuthResult> | FakeAuthResult;
 
-function createFakeContext(options: {
+interface FakeContextOptions {
   readonly model?: Model<Api>;
   readonly models?: readonly Model<Api>[];
   readonly auth?: FakeAuthResult | FakeAuthProvider;
   readonly widgets?: unknown[];
+  readonly cwd?: string;
   readonly notifications?: Array<{
     readonly message: string;
     readonly level: string;
   }>;
-}): ExtensionContext {
-  const models = options.models ?? [options.model ?? createFakeModel()];
+}
+
+function createFakeContext(options: FakeContextOptions): ExtensionContext {
+  const models = options.models ?? [options.model ?? fakeModel()];
+  // Safe: the fake context implements the UI and model registry members used by pi-tldr.
   return {
     hasUI: true,
+    cwd: options.cwd ?? process.cwd(),
     ui: {
       setWidget(_key: string, widget: unknown) {
         options.widgets?.push(widget);
@@ -163,11 +119,11 @@ interface FakeScheduledTask {
   canceled: boolean;
 }
 
-class FakeScheduler implements TldrScheduler {
+class FakeScheduler implements TimerScheduler {
   private nowMs = 0;
   private readonly tasks: FakeScheduledTask[] = [];
 
-  public setTimeout(callback: () => void, delayMs: number): FakeScheduledTask {
+  setTimeout(callback: () => void, delayMs: number): FakeScheduledTask {
     const task = {
       callback,
       runAtMs: this.nowMs + Math.max(0, delayMs),
@@ -177,11 +133,12 @@ class FakeScheduler implements TldrScheduler {
     return task;
   }
 
-  public clearTimeout(handle: unknown): void {
+  clearTimeout(handle: unknown): void {
+    // Safe: FakeScheduler only receives handles returned by its own setTimeout.
     (handle as FakeScheduledTask).canceled = true;
   }
 
-  public advanceBy(ms: number): void {
+  advanceBy(ms: number): void {
     const targetMs = this.nowMs + ms;
 
     while (true) {
@@ -209,15 +166,23 @@ async function flushAsyncWork(): Promise<void> {
   }
 }
 
+function startExtension(
+  dependencies: PiTldrDependencies = {},
+  contextOptions: FakeContextOptions = {},
+): FakePiHarness & { readonly ctx: ExtensionContext } {
+  const harness = createFakePiHarness();
+  const ctx = createFakeContext(contextOptions);
+  createPiTldr(dependencies)(harness.pi);
+  harness.events.get("session_start")?.({}, ctx);
+  return { ...harness, ctx };
+}
+
 describe("piTldr extension entrypoint", () => {
-  it("registers the flags, commands, and lifecycle event handlers", () => {
-    const flags: string[] = [];
+  it("registers the command and lifecycle event handlers", () => {
     const commands: string[] = [];
     const events: string[] = [];
+    // Safe: this test double implements only the registration methods used here.
     const pi = {
-      registerFlag(name: string) {
-        flags.push(name);
-      },
       registerCommand(name: string) {
         commands.push(name);
       },
@@ -228,7 +193,6 @@ describe("piTldr extension entrypoint", () => {
 
     piTldr(pi);
 
-    assert.deepEqual(flags, ["tldr-model"]);
     assert.deepEqual(commands, ["tldr"]);
     assert.deepEqual(events, [
       "session_start",
@@ -241,44 +205,13 @@ describe("piTldr extension entrypoint", () => {
     ]);
   });
 
-  it("toggles pi-tldr off for the current session", async () => {
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({ notifications });
-
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
-    );
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("off", ctx);
-    await commands.get("tldr")?.handler("status", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      [
-        "pi-tldr status",
-        "enabled: no",
-        "selected model: auto",
-        "active model: none",
-      ].join("\n"),
-    );
-  });
-
   it("shows available commands for bare /tldr", async () => {
     const notifications: Array<{
       readonly message: string;
       readonly level: string;
     }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({ notifications });
+    const { commands, ctx } = startExtension({}, { notifications });
 
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
-    );
-    events.get("session_start")?.({}, ctx);
     await commands.get("tldr")?.handler("", ctx);
 
     assert.deepEqual(notifications, [
@@ -287,33 +220,19 @@ describe("piTldr extension entrypoint", () => {
         message: [
           "pi-tldr commands",
           "/tldr help - show this help",
-          "/tldr status - show enabled and model status",
-          "/tldr stats - show latency and TLDR count",
-          "/tldr on - enable TLDRs for this session",
-          "/tldr off - disable TLDRs for this session",
-          "/tldr toggle - toggle TLDRs for this session",
-          "/tldr model - choose the TLDR model",
-          "/tldr model <model|auto|reset> - set the TLDR model",
-          "/tldr debug status - show debug log status",
-          "/tldr debug on [path] - write raw TLDR outputs to a JSONL log",
-          "/tldr debug off - stop writing the debug log",
+          "/tldr status - show selected and active model status",
         ].join("\n"),
       },
     ]);
   });
 
-  it("reports enabled status, selected model, and active auto model", async () => {
+  it("reports selected and active auto model status", async () => {
     const notifications: Array<{
       readonly message: string;
       readonly level: string;
     }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({ notifications });
+    const { commands, ctx } = startExtension({}, { notifications });
 
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
-    );
-    events.get("session_start")?.({}, ctx);
     await commands.get("tldr")?.handler("status", ctx);
 
     assert.deepEqual(notifications, [
@@ -321,7 +240,6 @@ describe("piTldr extension entrypoint", () => {
         level: "info",
         message: [
           "pi-tldr status",
-          "enabled: yes",
           "selected model: auto",
           "active model: anthropic/claude-haiku-4-5",
         ].join("\n"),
@@ -334,91 +252,87 @@ describe("piTldr extension entrypoint", () => {
       readonly message: string;
       readonly level: string;
     }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({
-      auth: { ok: false },
-      notifications,
-    });
-
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
+    const { commands, ctx } = startExtension(
+      {},
+      { auth: { ok: false }, notifications },
     );
-    events.get("session_start")?.({}, ctx);
+
     await commands.get("tldr")?.handler("status", ctx);
 
     assert.equal(
       notifications.at(-1)?.message,
-      [
-        "pi-tldr status",
-        "enabled: yes",
-        "selected model: auto",
-        "active model: none",
-      ].join("\n"),
+      ["pi-tldr status", "selected model: auto", "active model: none"].join(
+        "\n",
+      ),
     );
   });
 
-  it("reports directly selected models as selected and active", async () => {
+  it("reports settings-selected models as selected and active", async () => {
     const notifications: Array<{
       readonly message: string;
       readonly level: string;
     }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({
-      model: createFakeModel("openai-codex", "gpt-5.4-mini"),
-      notifications,
-    });
-
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
+    const cwd = createSettingsCwd("openai-codex/gpt-5.4-mini");
+    const { commands, ctx } = startExtension(
+      {},
+      {
+        cwd,
+        model: fakeModel("openai-codex", "gpt-5.4-mini"),
+        notifications,
+      },
     );
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("model openai-codex/gpt-5.4-mini", ctx);
-    await commands.get("tldr")?.handler("status", ctx);
 
-    assert.equal(
-      notifications.at(-1)?.message,
-      [
-        "pi-tldr status",
-        "enabled: yes",
-        "selected model: openai-codex/gpt-5.4-mini",
-        "active model: openai-codex/gpt-5.4-mini",
-      ].join("\n"),
-    );
+    try {
+      await commands.get("tldr")?.handler("status", ctx);
+
+      assert.equal(
+        notifications.at(-1)?.message,
+        [
+          "pi-tldr status",
+          "selected model: openai-codex/gpt-5.4-mini",
+          "active model: openai-codex/gpt-5.4-mini",
+        ].join("\n"),
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
-  it("reports active fallback when a selected model is unavailable", async () => {
-    const selectedModel = createFakeModel("openai-codex", "gpt-5.4-mini");
-    const fallbackModel = createFakeModel("anthropic", "claude-haiku-4-5");
+  it("reports active fallback when a configured model is unavailable", async () => {
+    const selectedModel = fakeModel("openai-codex", "gpt-5.4-mini");
+    const fallbackModel = fakeModel("anthropic", "claude-haiku-4-5");
     const notifications: Array<{
       readonly message: string;
       readonly level: string;
     }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({
-      models: [selectedModel, fallbackModel],
-      auth: (model) =>
-        model.provider === selectedModel.provider
-          ? { ok: false }
-          : { ok: true, apiKey: "test-key" },
-      notifications,
-    });
-
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
+    const cwd = createSettingsCwd("openai-codex/gpt-5.4-mini");
+    const { commands, ctx } = startExtension(
+      {},
+      {
+        cwd,
+        models: [selectedModel, fallbackModel],
+        auth: (model) =>
+          model.provider === selectedModel.provider
+            ? { ok: false }
+            : { ok: true, apiKey: "test-key" },
+        notifications,
+      },
     );
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("model openai-codex/gpt-5.4-mini", ctx);
-    await commands.get("tldr")?.handler("status", ctx);
 
-    assert.equal(
-      notifications.at(-1)?.message,
-      [
-        "pi-tldr status",
-        "enabled: yes",
-        "selected model: openai-codex/gpt-5.4-mini",
-        "active model: anthropic/claude-haiku-4-5",
-      ].join("\n"),
-    );
+    try {
+      await commands.get("tldr")?.handler("status", ctx);
+
+      assert.equal(
+        notifications.at(-1)?.message,
+        [
+          "pi-tldr status",
+          "selected model: openai-codex/gpt-5.4-mini",
+          "active model: anthropic/claude-haiku-4-5",
+        ].join("\n"),
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("reports active model auth check failures", async () => {
@@ -426,242 +340,40 @@ describe("piTldr extension entrypoint", () => {
       readonly message: string;
       readonly level: string;
     }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({
-      auth: () => {
-        throw new Error("auth failed");
+    const { commands, ctx } = startExtension(
+      {},
+      {
+        auth: () => {
+          throw new Error("auth failed");
+        },
+        notifications,
       },
-      notifications,
-    });
-
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
     );
-    events.get("session_start")?.({}, ctx);
+
     await commands.get("tldr")?.handler("status", ctx);
 
     assert.equal(
       notifications.at(-1)?.message,
       [
         "pi-tldr status",
-        "enabled: yes",
         "selected model: auto",
         "active model: unknown (auth check failed)",
       ].join("\n"),
     );
   });
 
-  it("reuses cached TLDR auth across agent runs", async () => {
-    const scheduler = new FakeScheduler();
-    let authCalls = 0;
-    let completionCalls = 0;
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => {
-        completionCalls++;
-        return createAssistantResponse(`Summarized step ${completionCalls}.`);
-      },
-    });
-    const ctx = createFakeContext({
-      auth: () => {
-        authCalls++;
-        return { ok: true, apiKey: "test-key" };
-      },
-    });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands
-      .get("tldr")
-      ?.handler("model anthropic/claude-haiku-4-5", ctx);
-    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    events.get("before_agent_start")?.({ prompt: "Update docs" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.equal(completionCalls, 2);
-    assert.equal(authCalls, 1);
-  });
-
-  it("invalidates cached TLDR auth when the selected model changes", async () => {
-    const scheduler = new FakeScheduler();
-    const authProviders: string[] = [];
-    const anthropicModel = createFakeModel("anthropic", "claude-haiku-4-5");
-    const openaiModel = createFakeModel("openai-codex", "gpt-5.4-mini");
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => createAssistantResponse("Updated current status."),
-    });
-    const ctx = createFakeContext({
-      models: [anthropicModel, openaiModel],
-      auth: (model) => {
-        authProviders.push(model.provider);
-        return { ok: true, apiKey: "test-key" };
-      },
-    });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands
-      .get("tldr")
-      ?.handler("model anthropic/claude-haiku-4-5", ctx);
-    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    await commands.get("tldr")?.handler("model openai-codex/gpt-5.4-mini", ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.deepEqual(authProviders, ["anthropic", "openai-codex"]);
-  });
-
-  it("clears cached TLDR auth after thrown generation failures", async () => {
-    const scheduler = new FakeScheduler();
-    let authCalls = 0;
-    let completionCalls = 0;
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => {
-        completionCalls++;
-        if (completionCalls === 1) throw new Error("provider failed");
-        return createAssistantResponse("Recovered current status.");
-      },
-    });
-    const ctx = createFakeContext({
-      auth: () => {
-        authCalls++;
-        return { ok: true, apiKey: "test-key" };
-      },
-    });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands
-      .get("tldr")
-      ?.handler("model anthropic/claude-haiku-4-5", ctx);
-    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.equal(completionCalls, 2);
-    assert.equal(authCalls, 2);
-  });
-
-  it("clears cached TLDR auth after error responses", async () => {
-    const scheduler = new FakeScheduler();
-    let authCalls = 0;
-    let completionCalls = 0;
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => {
-        completionCalls++;
-        return completionCalls === 1
-          ? createAssistantResponse("Provider failed.", "error")
-          : createAssistantResponse("Recovered current status.");
-      },
-    });
-    const ctx = createFakeContext({
-      auth: () => {
-        authCalls++;
-        return { ok: true, apiKey: "test-key" };
-      },
-    });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands
-      .get("tldr")
-      ?.handler("model anthropic/claude-haiku-4-5", ctx);
-    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.equal(completionCalls, 2);
-    assert.equal(authCalls, 2);
-  });
-
-  it("does not cache auth resolved after cache invalidation", async () => {
-    const scheduler = new FakeScheduler();
-    let authCalls = 0;
-    let resolveAuth: ((result: FakeAuthResult) => void) | undefined;
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => createAssistantResponse("Summarized status."),
-    });
-    const ctx = createFakeContext({
-      auth: () => {
-        authCalls++;
-        if (authCalls === 1) {
-          return new Promise<FakeAuthResult>((resolve) => {
-            resolveAuth = resolve;
-          });
-        }
-        return { ok: true, apiKey: "test-key" };
-      },
-    });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands
-      .get("tldr")
-      ?.handler("model anthropic/claude-haiku-4-5", ctx);
-    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.equal(authCalls, 1);
-
-    events.get("session_start")?.({}, ctx);
-    resolveAuth?.({ ok: true, apiKey: "stale-key" });
-    await flushAsyncWork();
-
-    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.equal(authCalls, 2);
-  });
-
-  it("does not cache auth from a superseded pending refinement", async () => {
+  it("ignores auth from a superseded pending TLDR", async () => {
     const scheduler = new FakeScheduler();
     let authCalls = 0;
     let resolveFirstAuth: ((result: FakeAuthResult) => void) | undefined;
     const completionKeys: string[] = [];
-    const { pi, commands, events } = createFakePiHarness();
+    const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
-      latencyNow: () => 0,
-      complete: async (_model, _context, options) => {
+      now: () => 0,
+      generateTldr: async (_model, _context, options) => {
         completionKeys.push(options?.apiKey ?? "");
-        return createAssistantResponse("Summarized latest status.");
+        return assistantResponse("Wrote latest TLDR.");
       },
     });
     const ctx = createFakeContext({
@@ -678,9 +390,6 @@ describe("piTldr extension entrypoint", () => {
 
     extension(pi);
     events.get("session_start")?.({}, ctx);
-    await commands
-      .get("tldr")
-      ?.handler("model anthropic/claude-haiku-4-5", ctx);
     events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
     scheduler.advanceBy(0);
     await flushAsyncWork();
@@ -688,7 +397,7 @@ describe("piTldr extension entrypoint", () => {
     assert.equal(authCalls, 1);
 
     events.get("message_update")?.(
-      { message: createAssistantResponse("Writing a newer status") },
+      { message: assistantResponse("Writing a newer status") },
       ctx,
     );
     resolveFirstAuth?.({ ok: true, apiKey: "stale-key" });
@@ -700,22 +409,21 @@ describe("piTldr extension entrypoint", () => {
     assert.deepEqual(completionKeys, ["fresh-key"]);
   });
 
-  it("does not cache automatic fallback auth across agent runs", async () => {
+  it("rechecks automatic fallback auth across agent runs", async () => {
     const scheduler = new FakeScheduler();
     let anthropicAvailable = false;
     const completionModels: string[] = [];
-    const anthropicModel = createFakeModel("anthropic", "claude-haiku-4-5");
-    const openaiModel = createFakeModel("openai-codex", "gpt-5.4-mini");
+    const anthropicModel = fakeModel("anthropic", "claude-haiku-4-5");
+    const openaiModel = fakeModel("openai-codex", "gpt-5.4-mini");
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
-      latencyNow: () => 0,
-      complete: async (model, _context, options) => {
+      now: () => 0,
+      generateTldr: async (model, _context, options) => {
         completionModels.push(
           `${model.provider}/${model.id}:${options?.apiKey}`,
         );
-        return createAssistantResponse(`Summarized with ${model.provider}.`);
+        return assistantResponse(`Wrote TLDR with ${model.provider}.`);
       },
     });
     const ctx = createFakeContext({
@@ -745,25 +453,26 @@ describe("piTldr extension entrypoint", () => {
     ]);
   });
 
-  it("does not cache selected-model fallback auth across agent runs", async () => {
+  it("rechecks configured-model fallback auth across agent runs", async () => {
     const scheduler = new FakeScheduler();
     let selectedAvailable = false;
     const completionModels: string[] = [];
-    const selectedModel = createFakeModel("openai-codex", "gpt-5.4-mini");
-    const fallbackModel = createFakeModel("anthropic", "claude-haiku-4-5");
-    const { pi, commands, events } = createFakePiHarness();
+    const selectedModel = fakeModel("openai-codex", "gpt-5.4-mini");
+    const fallbackModel = fakeModel("anthropic", "claude-haiku-4-5");
+    const cwd = createSettingsCwd("openai-codex/gpt-5.4-mini");
+    const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
       scheduler,
-      latencyNow: () => 0,
-      complete: async (model, _context, options) => {
+      now: () => 0,
+      generateTldr: async (model, _context, options) => {
         completionModels.push(
           `${model.provider}/${model.id}:${options?.apiKey}`,
         );
-        return createAssistantResponse(`Summarized with ${model.provider}.`);
+        return assistantResponse(`Wrote TLDR with ${model.provider}.`);
       },
     });
     const ctx = createFakeContext({
+      cwd,
       models: [selectedModel, fallbackModel],
       auth: (model) => {
         if (model.provider === "openai-codex" && !selectedAvailable) {
@@ -773,934 +482,70 @@ describe("piTldr extension entrypoint", () => {
       },
     });
 
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("model openai-codex/gpt-5.4-mini", ctx);
-    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    selectedAvailable = true;
-    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.deepEqual(completionModels, [
-      "anthropic/claude-haiku-4-5:anthropic-key",
-      "openai-codex/gpt-5.4-mini:openai-codex-key",
-    ]);
-  });
-
-  it("clears cached TLDR auth when disabled", async () => {
-    const scheduler = new FakeScheduler();
-    let authCalls = 0;
-    const completionKeys: string[] = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async (_model, _context, options) => {
-        completionKeys.push(options?.apiKey ?? "");
-        return createAssistantResponse("Summarized current status.");
-      },
-    });
-    const ctx = createFakeContext({
-      auth: () => {
-        authCalls++;
-        return { ok: true, apiKey: `key-${authCalls}` };
-      },
-    });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands
-      .get("tldr")
-      ?.handler("model anthropic/claude-haiku-4-5", ctx);
-    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    await commands.get("tldr")?.handler("off", ctx);
-    await commands.get("tldr")?.handler("on", ctx);
-    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.equal(authCalls, 2);
-    assert.deepEqual(completionKeys, ["key-1", "key-2"]);
-  });
-
-  it("asks users to retry when status keeps changing during model checks", async () => {
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    let ctx: ExtensionContext;
-    ctx = createFakeContext({
-      auth: () => {
-        events.get("session_start")?.({}, ctx);
-        return { ok: true, apiKey: "test-key" };
-      },
-      notifications,
-    });
-
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
-    );
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("status", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr status", "status changed while checking; run /tldr again"].join(
-        "\n",
-      ),
-    );
-  });
-
-  it("reports no latency stats before a TLDR widget update", async () => {
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({ notifications });
-
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
-    );
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.deepEqual(notifications, [
-      {
-        level: "info",
-        message: ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join(
-          "\n",
-        ),
-      },
-    ]);
-  });
-
-  it("reports average latency from trigger to accepted widget update", async () => {
-    let now = 1_000;
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const responses = [
-      "Inspecting repository status.",
-      "Updated the project scripts.",
-    ];
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      latencyNow: () => now,
-      complete: async () => {
-        const response = responses.shift();
-        now += response?.startsWith("Inspecting") ? 250 : 450;
-        return createAssistantResponse(response ?? "Finished the task.");
-      },
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
-    await waitForTimers();
-
-    now = 2_000;
-    events.get("before_agent_start")?.({ prompt: "Update scripts" }, ctx);
-    await waitForTimers();
-
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: 350ms", "tldrs: 2"].join("\n"),
-    );
-  });
-
-  it("resets latency stats on session start", async () => {
-    let now = 1_000;
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      latencyNow: () => now,
-      complete: async () => {
-        now += 125;
-        return createAssistantResponse("Inspecting repository status.");
-      },
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
-    await waitForTimers();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: 125ms", "tldrs: 1"].join("\n"),
-    );
-
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("reports accepted final TLDR stats", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        createAssistantResponse("Completed the requested task."),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
-    );
-  });
-
-  it("writes raw TLDR model output to the debug log", async () => {
-    const scheduler = new FakeScheduler();
-    const logLines: string[] = [];
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      wallClockNow: () => Date.parse("2026-05-06T12:00:00.000Z"),
-      debugLogWriter: (_filePath, line) => {
-        logLines.push(line);
-      },
-      complete: async () =>
-        createAssistantResponse("**Finished updating tests.**\nExtra detail."),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("debug on ./tldr-debug.jsonl", ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.equal(logLines.length, 1);
-    assert.deepEqual(JSON.parse(logLines[0] ?? "{}"), {
-      timestamp: "2026-05-06T12:00:00.000Z",
-      source: "final",
-      model: "anthropic/claude-haiku-4-5",
-      outcome: "invalid model output",
-      accepted: false,
-      stopReason: "stop",
-      rawOutput: "**Finished updating tests.**\nExtra detail.",
-    });
-  });
-
-  it("creates debug log files with private permissions", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "pi-tldr-test-"));
     try {
-      const scheduler = new FakeScheduler();
-      const logPath = join(tempDir, "pi-tldr-debug.jsonl");
-      const { pi, commands, events } = createFakePiHarness();
-      const extension = createPiTldr({
-        preferredModelStore: createMemoryPreferredModelStore(),
-        scheduler,
-        latencyNow: () => 0,
-        complete: async () => createAssistantResponse("Checking status."),
-      });
-      const ctx = createFakeContext({});
-
       extension(pi);
       events.get("session_start")?.({}, ctx);
-      await commands.get("tldr")?.handler(`debug on ${logPath}`, ctx);
-      events.get("message_update")?.(
-        { message: createAssistantResponse("Working on the task.") },
-        ctx,
-      );
+      events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
       scheduler.advanceBy(0);
       await flushAsyncWork();
 
-      assert.equal(statSync(logPath).mode & 0o777, 0o600);
+      selectedAvailable = true;
+      events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
+      scheduler.advanceBy(0);
+      await flushAsyncWork();
+
+      assert.deepEqual(completionModels, [
+        "anthropic/claude-haiku-4-5:anthropic-key",
+        "openai-codex/gpt-5.4-mini:openai-codex-key",
+      ]);
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 
-  it("disables debug logging after write failures", async () => {
-    const scheduler = new FakeScheduler();
+  it("reports the model selected when status was invoked", async () => {
     const notifications: Array<{
       readonly message: string;
       readonly level: string;
     }> = [];
+    const openaiModel = fakeModel("openai-codex", "gpt-5.4-mini");
+    const anthropicModel = fakeModel("anthropic", "claude-haiku-4-5");
+    const openaiCwd = createSettingsCwd("openai-codex/gpt-5.4-mini");
+    const anthropicCwd = createSettingsCwd("anthropic/claude-haiku-4-5");
     const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      debugLogWriter: () => {
-        throw new Error("disk full");
-      },
-      complete: async () => createAssistantResponse("Checking status."),
-    });
-    const ctx = createFakeContext({ notifications });
 
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("debug on ./tldr-debug.jsonl", ctx);
-    events.get("message_update")?.(
-      { message: createAssistantResponse("Working on the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("debug status", ctx);
+    try {
+      const laterCtx = createFakeContext({
+        cwd: anthropicCwd,
+        models: [openaiModel, anthropicModel],
+        notifications,
+      });
+      const statusCtx = createFakeContext({
+        cwd: openaiCwd,
+        models: [openaiModel, anthropicModel],
+        notifications,
+        auth: () => {
+          events.get("session_start")?.({}, laterCtx);
+          return { ok: true, apiKey: "test-key" };
+        },
+      });
 
-    assert.equal(
-      notifications.at(-2)?.message,
-      [
-        "pi-tldr debug file logging disabled after write failure",
-        `path: ${resolve("./tldr-debug.jsonl")}`,
-        "error: disk full",
-      ].join("\n"),
-    );
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr debug", "file logging: off"].join("\n"),
-    );
-  });
+      createPiTldr()(pi);
+      events.get("session_start")?.({}, statusCtx);
+      await commands.get("tldr")?.handler("status", statusCtx);
 
-  it("accepts clean final TLDR output above the prompt target but within the hard limit", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const cleanLongSummary =
-      "Completed an explanation of major computer science figures and their contributions, organized by foundational areas including pioneers of mechanical computing, mathematical logic, and theoretical computation.";
-    assert(cleanLongSummary.length > 180);
-    assert(cleanLongSummary.length <= 220);
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => createAssistantResponse(cleanLongSummary),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
-    );
-  });
-
-  it("reports invalid final TLDR model output", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        createAssistantResponse("- Completed the requested task."),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("reports when final TLDR has no available model", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-    });
-    const ctx = createFakeContext({ notifications, auth: { ok: false } });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("reports pending final TLDR attempts", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        createAssistantResponse("Completed the requested task."),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("reports final TLDR auth check failures", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-    });
-    const ctx = createFakeContext({
-      notifications,
-      auth: () => {
-        throw new Error("auth failed");
-      },
-    });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("reports incomplete final TLDR responses", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        createAssistantResponse("Completed the requested task.", "length"),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("reports final TLDR request failures", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => {
-        throw new Error("request failed");
-      },
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("reports cleared empty final TLDRs", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.({ message: createAssistantResponse("") }, ctx);
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("reports unchanged final TLDR facts", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        createAssistantResponse("Completed the requested task."),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
-    );
-  });
-
-  it("reports duplicate final summaries", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        createAssistantResponse("Completed the requested task."),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("before_agent_start")?.({ prompt: "Do the task" }, ctx);
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
-    );
-  });
-
-  it("reports stale final TLDRs canceled before they start", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        createAssistantResponse("Completed the requested task."),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    events.get("before_agent_start")?.({ prompt: "Start another task" }, ctx);
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("does not let stale final TLDRs overwrite newer final outcomes", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const completions: Array<{
-      readonly resolve: (
-        response: ReturnType<typeof createAssistantResponse>,
-      ) => void;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        new Promise<ReturnType<typeof createAssistantResponse>>((resolve) => {
-          completions.push({ resolve });
-        }),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("First final text.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Second final text.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-
-    assert.equal(completions.length, 2);
-
-    completions[1]?.resolve(
-      createAssistantResponse("Completed the newer task."),
-    );
-    await flushAsyncWork();
-    completions[0]?.resolve(
-      createAssistantResponse("Completed the older task."),
-    );
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
-    );
-  });
-
-  it("reports active final TLDRs as stale when canceled", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => new Promise(() => undefined),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    events.get("before_agent_start")?.({ prompt: "Start another task" }, ctx);
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("reports active final TLDRs as stale when superseded by regular work", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => new Promise(() => undefined),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands
-      .get("tldr")
-      ?.handler("model anthropic/claude-haiku-4-5", ctx);
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("does not let duplicate final facts hide an accepted in-flight final", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    let resolveFinal:
-      | ((response: ReturnType<typeof createAssistantResponse>) => void)
-      | undefined;
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        new Promise<ReturnType<typeof createAssistantResponse>>((resolve) => {
-          resolveFinal = resolve;
-        }),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    resolveFinal?.(createAssistantResponse("Completed the requested task."));
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: 0ms", "tldrs: 1"].join("\n"),
-    );
-  });
-
-  it("ignores late final messages after session shutdown", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    let completions = 0;
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () => {
-        completions++;
-        return createAssistantResponse("Completed the requested task.");
-      },
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("session_shutdown")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Late final after shutdown.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(completions, 0);
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
-  });
-
-  it("keeps cleared as the last final outcome after canceling active final work", async () => {
-    const scheduler = new FakeScheduler();
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    let rejectFinal: ((error: Error) => void) | undefined;
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      scheduler,
-      latencyNow: () => 0,
-      complete: async () =>
-        new Promise<ReturnType<typeof createAssistantResponse>>(
-          (_resolve, reject) => {
-            rejectFinal = reject;
-          },
-        ),
-    });
-    const ctx = createFakeContext({ notifications });
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    events.get("message_end")?.(
-      { message: createAssistantResponse("Done with the task.") },
-      ctx,
-    );
-    scheduler.advanceBy(0);
-    await flushAsyncWork();
-    events.get("message_end")?.({ message: createAssistantResponse("") }, ctx);
-    rejectFinal?.(new Error("aborted after clear"));
-    await flushAsyncWork();
-    await commands.get("tldr")?.handler("stats", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      ["pi-tldr session stats", "avg latency: n/a", "tldrs: 0"].join("\n"),
-    );
+      assert.equal(
+        notifications.at(-1)?.message,
+        [
+          "pi-tldr status",
+          "selected model: openai-codex/gpt-5.4-mini",
+          "active model: openai-codex/gpt-5.4-mini",
+        ].join("\n"),
+      );
+    } finally {
+      rmSync(openaiCwd, { recursive: true, force: true });
+      rmSync(anthropicCwd, { recursive: true, force: true });
+    }
   });
 
   it("coalesces quick tool activity into one TLDR request", async () => {
@@ -1709,14 +554,13 @@ describe("piTldr extension entrypoint", () => {
     const systemPrompts: string[] = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
       toolActivityCoalesceMs: 20,
       scheduler,
-      latencyNow: () => 0,
-      complete: async (_model, context) => {
+      now: () => 0,
+      generateTldr: async (_model, context) => {
         completionPayloads.push(JSON.stringify(context));
         systemPrompts.push(context.systemPrompt ?? "");
-        return createAssistantResponse("Checking command results.");
+        return assistantResponse("Checking command results.");
       },
     });
     const ctx = createFakeContext({});
@@ -1756,22 +600,23 @@ describe("piTldr extension entrypoint", () => {
     assert.equal(completionPayloads.length, 1);
     assert.match(systemPrompts[0] ?? "", /doing right now/);
     assert.match(systemPrompts[0] ?? "", /latest event facts/);
-    assert.match(completionPayloads[0] ?? "", /tool_end/);
+    assert.match(systemPrompts[0] ?? "", /Do not speak as the assistant/);
+    assert.match(systemPrompts[0] ?? "", /Output only the TLDR sentence/);
+    assert.match(completionPayloads[0] ?? "", /Tool finished: bash/);
     assert.match(completionPayloads[0] ?? "", /Tests passed/);
   });
 
-  it("lets final summaries bypass pending tool coalescing", async () => {
+  it("lets final TLDRs bypass pending tool coalescing", async () => {
     const scheduler = new FakeScheduler();
     const completionPayloads: string[] = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
       toolActivityCoalesceMs: 50,
       scheduler,
-      latencyNow: () => 0,
-      complete: async (_model, context) => {
+      now: () => 0,
+      generateTldr: async (_model, context) => {
         completionPayloads.push(JSON.stringify(context));
-        return createAssistantResponse("Completed the requested change.");
+        return assistantResponse("Completed the requested change.");
       },
     });
     const ctx = createFakeContext({});
@@ -1792,16 +637,16 @@ describe("piTldr extension entrypoint", () => {
     assert.equal(completionPayloads.length, 0);
 
     events.get("message_end")?.(
-      { message: createAssistantResponse("All done.") },
+      { message: assistantResponse("All done.") },
       ctx,
     );
     scheduler.advanceBy(0);
     await flushAsyncWork();
 
     assert.equal(completionPayloads.length, 1);
-    assert.match(completionPayloads[0] ?? "", /message_end/);
+    assert.match(completionPayloads[0] ?? "", /Assistant final response/);
     assert.match(completionPayloads[0] ?? "", /All done/);
-    assert.doesNotMatch(completionPayloads[0] ?? "", /tool_start/);
+    assert.doesNotMatch(completionPayloads[0] ?? "", /Tool started/);
 
     scheduler.advanceBy(50);
     await flushAsyncWork();
@@ -1809,24 +654,23 @@ describe("piTldr extension entrypoint", () => {
     assert.equal(completionPayloads.length, 1);
   });
 
-  it("ignores an in-flight tool TLDR after a final summary starts", async () => {
+  it("ignores an in-flight tool TLDR after a final TLDR starts", async () => {
     const scheduler = new FakeScheduler();
-    const widgets: Array<unknown> = [];
+    const widgets: unknown[] = [];
     const completions: Array<{
       readonly context: string;
       readonly options?: ProviderStreamOptions;
       readonly resolve: (
-        response: ReturnType<typeof createAssistantResponse>,
+        response: ReturnType<typeof assistantResponse>,
       ) => void;
     }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
       toolActivityCoalesceMs: 20,
       scheduler,
-      latencyNow: () => 0,
-      complete: async (_model, context, options) =>
-        new Promise<ReturnType<typeof createAssistantResponse>>((resolve) => {
+      now: () => 0,
+      generateTldr: async (_model, context, options) =>
+        new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
           completions.push({
             context: JSON.stringify(context),
             options,
@@ -1850,11 +694,11 @@ describe("piTldr extension entrypoint", () => {
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
-    assert.match(completions[0]?.context ?? "", /tool_start/);
+    assert.match(completions[0]?.context ?? "", /Tool started: bash/);
     assert.equal(completions[0]?.options?.signal?.aborted, false);
 
     events.get("message_end")?.(
-      { message: createAssistantResponse("All done.") },
+      { message: assistantResponse("All done.") },
       ctx,
     );
     scheduler.advanceBy(0);
@@ -1862,30 +706,62 @@ describe("piTldr extension entrypoint", () => {
 
     assert.equal(completions.length, 2);
     assert.equal(completions[0]?.options?.signal?.aborted, true);
-    assert.match(completions[1]?.context ?? "", /message_end/);
+    assert.match(completions[1]?.context ?? "", /Assistant final response/);
 
-    completions[0]?.resolve(createAssistantResponse("Running command output."));
+    completions[0]?.resolve(assistantResponse("Running command output."));
     await flushAsyncWork();
 
     assert.equal(widgets.length, 1);
     assert.equal(widgets[0], undefined);
 
-    completions[1]?.resolve(createAssistantResponse("Completed the task."));
+    completions[1]?.resolve(assistantResponse("Completed the task."));
     await flushAsyncWork();
 
     assert.equal(widgets.length, 2);
     assert.equal(typeof widgets[1], "function");
   });
 
-  it("drives a prompt-start summary into the widget", async () => {
-    const widgets: Array<unknown> = [];
+  it("renders raw TLDR model output without validation", async () => {
+    const scheduler = new FakeScheduler();
+    const widgets: unknown[] = [];
+    const rawOutputs = [
+      "- Inspecting files",
+      "[Inspecting](https://example.test)",
+      "<status>Inspecting</status>",
+      '{"status":"running"}',
+      "Line one\nLine two",
+      "a".repeat(221),
+    ];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      scheduler,
+      now: () => 0,
+      generateTldr: async () => assistantResponse(rawOutputs.shift() ?? ""),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    for (const prompt of ["one", "two", "three", "four", "five", "six"]) {
+      events.get("before_agent_start")?.({ prompt }, ctx);
+      scheduler.advanceBy(0);
+      await flushAsyncWork();
+    }
+
+    assert.equal(
+      widgets.filter((widget) => typeof widget === "function").length,
+      6,
+    );
+  });
+
+  it("drives a prompt-start TLDR into the widget", async () => {
+    const widgets: unknown[] = [];
     const { pi, events } = createFakePiHarness();
     const completeCalls: Array<{ options?: ProviderStreamOptions }> = [];
     const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      complete: async (_model, _context, options) => {
+      generateTldr: async (_model, _context, options) => {
         completeCalls.push({ options });
-        return createAssistantResponse("Inspecting repository status.");
+        return assistantResponse("Inspecting repository status.");
       },
     });
     const ctx = createFakeContext({ widgets });
@@ -1904,171 +780,79 @@ describe("piTldr extension entrypoint", () => {
     assert.equal(typeof widgets[2], "function");
   });
 
-  it("aborts in-flight TLDR work when disabled", async () => {
+  it("aborts in-flight TLDR work and clears the widget on session shutdown", async () => {
+    let completionCalls = 0;
     let abortSignal: AbortSignal | undefined;
-    const widgets: Array<unknown> = [];
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
+    const scheduler = new FakeScheduler();
+    const widgets: unknown[] = [];
+    const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      complete: async (_model, _context, options) => {
+      toolActivityCoalesceMs: 0,
+      scheduler,
+      now: () => 0,
+      generateTldr: async (_model, _context, options) => {
+        completionCalls++;
+        if (completionCalls === 1) {
+          return assistantResponse("Inspecting repository status.");
+        }
+
         abortSignal = options?.signal;
         return new Promise(() => undefined);
       },
     });
-    const ctx = createFakeContext({ notifications, widgets });
+    const ctx = createFakeContext({ widgets });
 
     extension(pi);
     events.get("session_start")?.({}, ctx);
     events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
-    await waitForTimers();
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
+
+    assert.equal(typeof widgets.at(-1), "function");
+
+    events.get("tool_call")?.(
+      {
+        toolName: "read",
+        toolCallId: "tool-1",
+        input: { path: "README.md" },
+      },
+      ctx,
+    );
+    scheduler.advanceBy(0);
+    await flushAsyncWork();
 
     assert.equal(abortSignal?.aborted, false);
 
-    await commands.get("tldr")?.handler("off", ctx);
+    events.get("session_shutdown")?.({}, ctx);
 
     assert.equal(abortSignal?.aborted, true);
     assert.equal(widgets.at(-1), undefined);
-    assert.equal(
-      notifications.at(-1)?.message,
-      "pi-tldr disabled for this session",
-    );
   });
 
-  it("does not send facts recorded while disabled after reenable", async () => {
-    let completionPayload = "";
-    const { pi, commands, events } = createFakePiHarness();
-    const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      complete: async (_model, context) => {
-        completionPayload = JSON.stringify(context);
-        return createAssistantResponse("Inspecting safe follow-up work.");
-      },
-    });
-    const ctx = createFakeContext({});
-
-    extension(pi);
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("off", ctx);
-    events.get("before_agent_start")?.(
-      { prompt: "Sensitive disabled prompt" },
-      ctx,
-    );
-    events.get("message_update")?.(
-      { message: createAssistantResponse("Sensitive disabled update") },
-      ctx,
-    );
-    await commands.get("tldr")?.handler("on", ctx);
-    events.get("message_update")?.(
-      { message: createAssistantResponse("Safe enabled update") },
-      ctx,
-    );
-    await waitForTimers();
-
-    assert.equal(completionPayload.includes("Safe enabled update"), true);
-    assert.equal(completionPayload.includes("Sensitive disabled"), false);
-  });
-
-  it("resets disabled state on the next session start", async () => {
+  it("reports invalid /tldr actions", async () => {
     const notifications: Array<{
       readonly message: string;
       readonly level: string;
     }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({ notifications });
+    const { commands, ctx } = startExtension({}, { notifications });
 
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
-    );
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("off", ctx);
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("status", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      [
-        "pi-tldr status",
-        "enabled: yes",
-        "selected model: auto",
-        "active model: anthropic/claude-haiku-4-5",
-      ].join("\n"),
-    );
-  });
-
-  it("supports /tldr toggle, status, and invalid actions", async () => {
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({ notifications });
-
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
-    );
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("toggle", ctx);
-    await commands.get("tldr")?.handler("status", ctx);
     await commands.get("tldr")?.handler("later", ctx);
+    await commands.get("tldr")?.handler("stats", ctx);
+    await commands.get("tldr")?.handler("debug status", ctx);
 
-    assert.equal(
-      notifications.at(-3)?.message,
-      "pi-tldr disabled for this session",
-    );
-    assert.equal(
-      notifications.at(-2)?.message,
-      [
-        "pi-tldr status",
-        "enabled: no",
-        "selected model: auto",
-        "active model: none",
-      ].join("\n"),
-    );
-    assert.deepEqual(notifications.at(-1), {
-      message:
-        "Use /tldr [help|status|stats|debug|on|off|toggle|model <model>]",
-      level: "error",
-    });
-  });
-
-  it("reenables pi-tldr locally after it has been disabled", async () => {
-    const notifications: Array<{
-      readonly message: string;
-      readonly level: string;
-    }> = [];
-    const { pi, commands, events } = createFakePiHarness();
-    const ctx = createFakeContext({ notifications });
-
-    createPiTldr({ preferredModelStore: createMemoryPreferredModelStore() })(
-      pi,
-    );
-    events.get("session_start")?.({}, ctx);
-    await commands.get("tldr")?.handler("off", ctx);
-    await commands.get("tldr")?.handler("on", ctx);
-    await commands.get("tldr")?.handler("status", ctx);
-
-    assert.equal(
-      notifications.at(-1)?.message,
-      [
-        "pi-tldr status",
-        "enabled: yes",
-        "selected model: auto",
-        "active model: anthropic/claude-haiku-4-5",
-      ].join("\n"),
-    );
+    assert.deepEqual(notifications, [
+      { message: "Use /tldr [help|status]", level: "error" },
+      { message: "Use /tldr [help|status]", level: "error" },
+      { message: "Use /tldr [help|status]", level: "error" },
+    ]);
   });
 
   it("clears the widget and aborts stale work after an empty final stop", async () => {
     let abortSignal: AbortSignal | undefined;
-    const widgets: Array<unknown> = [];
+    const widgets: unknown[] = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      preferredModelStore: createMemoryPreferredModelStore(),
-      complete: async (_model, _context, options) => {
+      generateTldr: async (_model, _context, options) => {
         abortSignal = options?.signal;
         return new Promise(() => undefined);
       },
@@ -2082,7 +866,7 @@ describe("piTldr extension entrypoint", () => {
 
     assert.equal(abortSignal?.aborted, false);
 
-    events.get("message_end")?.({ message: createAssistantResponse("") }, ctx);
+    events.get("message_end")?.({ message: assistantResponse("") }, ctx);
 
     assert.equal(abortSignal?.aborted, true);
     assert.equal(widgets.at(-1), undefined);

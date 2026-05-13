@@ -6,5 +6,5 @@
     "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["src/tldr-core.ts", "test/**/*.test.ts"]
+  "include": ["src/**/*.ts", "test/**/*.test.ts"]
 }

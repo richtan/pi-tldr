@@ -1,7 +1,7 @@
 {
   "name": "pi-tldr",
   "version": "0.4.1",
-  "description": "A pi coding-agent extension that shows live TLDR summaries above the input bar.",
+  "description": "A pi coding-agent extension that shows live TLDRs above the input bar.",
   "type": "module",
   "license": "MIT",
   "author": "Richie Tan",
@@ -25,8 +25,8 @@
   ],
   "scripts": {
     "check": "tsc --noEmit",
-    "build:test": "node -e \"require('node:fs').rmSync('.tmp-test', { recursive: true, force: true })\" && tsc -p tsconfig.test.json",
-    "test": "npm run build:test && node --test .tmp-test/test/*.test.js",
+    "build:test": "node --input-type=module -e \"import {rmSync} from 'node:fs'; rmSync('.tmp-test', {recursive: true, force: true})\" && tsc -p tsconfig.test.json",
+    "test": "npm run build:test && node --test .tmp-test/test/*.js",
     "format": "prettier --write README.md package.json \"tsconfig*.json\" \".github/workflows/*.yml\" \"src/**/*.ts\" \"test/**/*.ts\"",
     "format:check": "prettier --check README.md package.json \"tsconfig*.json\" \".github/workflows/*.yml\" \"src/**/*.ts\" \"test/**/*.ts\"",
     "pack:dry-run": "npm pack --dry-run"
