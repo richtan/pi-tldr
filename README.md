@@ -83,7 +83,7 @@ User-wide:
 
 ```json
 {
-  "pi-tldr": {
+  "tldr": {
     "model": "anthropic/claude-haiku-4-5"
   }
 }

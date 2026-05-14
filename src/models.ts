@@ -9,7 +9,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
 
-const SETTINGS_KEY = "pi-tldr";
+const SETTINGS_KEY = "tldr";
 
 /** Provider/model choice for TLDR completions. */
 export interface TldrModelPreference {
@@ -37,7 +37,7 @@ const FAST_MODEL_CANDIDATES: readonly TldrModelPreference[] = [
   { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
 ];
 
-/** Parsed presence/value state for the `pi-tldr.model` setting. */
+/** Parsed presence/value state for the `tldr.model` setting. */
 interface SettingsModelValue {
   readonly present: boolean;
   readonly value?: string;
@@ -91,11 +91,12 @@ function parseModelSpec(value: string): TldrModelPreference | undefined {
   };
 }
 
-/** Extracts the optional `pi-tldr.model` setting from parsed settings. */
+/** Extracts an optional model setting from parsed settings. */
 function settingsModelValue(
   settings: Record<string, unknown>,
+  key: string,
 ): SettingsModelValue {
-  const section = settings[SETTINGS_KEY];
+  const section = settings[key];
   if (!section || typeof section !== "object" || Array.isArray(section)) {
     return { present: false };
   }
@@ -122,6 +123,7 @@ export function resolveInitialModelPreference(
   const settings = SettingsManager.create(cwd);
   const projectModel = settingsModelValue(
     settings.getProjectSettings() as Record<string, unknown>,
+    SETTINGS_KEY,
   );
   if (projectModel.present) {
     return projectModel.value ? parseModelSpec(projectModel.value) : undefined;
@@ -129,6 +131,7 @@ export function resolveInitialModelPreference(
 
   const userModel = settingsModelValue(
     settings.getGlobalSettings() as Record<string, unknown>,
+    SETTINGS_KEY,
   );
   return userModel.value ? parseModelSpec(userModel.value) : undefined;
 }

@@ -61,7 +61,7 @@ describe("tldr model settings", () => {
     }
   });
 
-  it("uses user settings when project settings do not configure pi-tldr", () => {
+  it("uses user settings when project settings do not configure tldr", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "pi-tldr-settings-"));
     try {
       const home = join(tempDir, "home");
