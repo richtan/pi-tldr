@@ -37,23 +37,26 @@ const TLDR_REQUEST_TIMEOUT_MS = 1_800;
 /** Default interval used to throttle ordinary widget display updates. */
 export const DEFAULT_DISPLAY_UPDATE_INTERVAL_MS = DISPLAY_UPDATE_INTERVAL_MS;
 
-const TLDR_SYSTEM_PROMPT_PREFIX = `You write live status TLDRs for a terminal coding agent.
+const IN_PROGRESS_TLDR_INSTRUCTION =
+  "Start with a present-tense action verb form ending in -ing.";
+const FINAL_TLDR_INSTRUCTION = "Start with a past-tense action verb.";
+
+/** Builds a system prompt with the checkpoint-specific tense instruction. */
+function tldrSystemPrompt(tenseInstruction: string): string {
+  return `You write live status TLDRs for a terminal coding agent.
 Return one short, complete, plain-English sentence under ${PROMPT_TARGET_SUMMARY_CHARS} characters.
 The sentence must be complete and must not trail off.
 Describe what the agent is doing right now for the user's task.
 Use previous generated TLDR checkpoints as compressed context.
-Use new raw activity to update the status through the requested activity.`;
-
-const TLDR_SYSTEM_PROMPT_SUFFIX = `Do not use first person.
+Use new raw activity to update the status through the requested activity.
+${tenseInstruction}
+Do not use first person.
 Do not address the user directly.
 Do not speak as the assistant.
 Do not output JSON, markdown, code, logs, diffs, XML, bullet points, or quoted strings.
 Do not mention tool names, command names, raw arguments, or individual file names.
 Output only the TLDR sentence.`;
-
-const IN_PROGRESS_TLDR_INSTRUCTION =
-  "Start with a present-tense action verb form ending in -ing.";
-const FINAL_TLDR_INSTRUCTION = "Start with a past-tense action verb.";
+}
 
 /** Function shape used to call the model that writes TLDR text. */
 export type TldrModelCall = typeof complete;
@@ -576,11 +579,7 @@ function checkpointSystemPrompt(job: TldrCheckpointJob): string {
       ? FINAL_TLDR_INSTRUCTION
       : IN_PROGRESS_TLDR_INSTRUCTION;
 
-  return [
-    TLDR_SYSTEM_PROMPT_PREFIX,
-    tenseInstruction,
-    TLDR_SYSTEM_PROMPT_SUFFIX,
-  ].join("\n");
+  return tldrSystemPrompt(tenseInstruction);
 }
 
 /** Builds the single user message sent to the TLDR model for a checkpoint. */
