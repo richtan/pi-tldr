@@ -1,8 +1,9 @@
 /**
- * @fileoverview Tests for raw TLDR fact collection.
+ * @fileoverview Tests for indexed TLDR activity collection.
  *
  * These tests verify that prompts, assistant messages, tool calls, tool results,
- * and final stops are recorded without sanitizing, truncating, or validating text.
+ * and final stops are recorded as bounded model-visible activities without
+ * redaction.
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
@@ -86,40 +87,40 @@ describe("TldrFactCollector", () => {
       timestamp: Date.now(),
     } as AgentMessage;
 
-    assert.equal(facts.recordAssistantUpdate(userMessage), false);
+    assert.equal(facts.recordAssistantUpdate(userMessage), undefined);
     assert.equal(facts.recordMessageEnd(userMessage), "ignored");
-    assert.equal(facts.snapshot(), "");
+    assert.deepEqual(facts.activitiesAfter(0, facts.latestActivityIndex()), []);
   });
 
-  it("returns prompt and assistant update snapshots", () => {
+  it("records a user message as an immediate indexed activity", () => {
     const facts = new TldrFactCollector();
 
-    facts.reset("Please inspect the repository status");
-    assert.equal(
-      facts.recordAssistantUpdate(
-        assistantMessage("Checking recent changes before continuing"),
-      ),
-      true,
-    );
+    const activity = facts.recordUserMessage("Please inspect the repository");
 
-    assert.equal(
-      facts.snapshot(),
-      "Prompt: Please inspect the repository status\nAssistant update: Checking recent changes before continuing",
-    );
+    assert.deepEqual(activity, {
+      index: 1,
+      activityType: "user_message",
+      displayPriority: "immediate",
+      text: "User message: Please inspect the repository",
+    });
+    assert.equal(facts.latestActivityIndex(), 1);
   });
 
-  it("records raw tool starts and results", () => {
+  it("increments indexes across assistant, tool, and final activities", () => {
     const facts = new TldrFactCollector();
-    facts.reset();
 
-    facts.recordToolCall(
+    const userMessage = facts.recordUserMessage("Check status");
+    const assistantUpdate = facts.recordAssistantUpdate(
+      assistantMessage("Checking recent changes before continuing"),
+    );
+    const toolCall = facts.recordToolCall(
       toolCallEvent({
         toolName: "bash",
         toolCallId: "tool-1",
         input: { command: "\u001b[31mnpm test\u001b[0m" },
       }),
     );
-    facts.recordToolResult(
+    const toolResult = facts.recordToolResult(
       toolResultEvent({
         toolName: "bash",
         toolCallId: "tool-1",
@@ -127,62 +128,107 @@ describe("TldrFactCollector", () => {
         content: [{ type: "text", text: "\u001b[32mTests passed\u001b[0m" }],
       }),
     );
+    const finalActivity = facts.recordMessageEnd(assistantMessage("Done."));
 
-    assert.equal(
-      facts.snapshot(),
-      "Tool started: bash\nTool finished: bash (ok)\n\u001b[32mTests passed\u001b[0m",
-    );
+    assert.equal(userMessage.index, 1);
+    assert.equal(assistantUpdate?.index, 2);
+    assert.equal(toolCall.index, 3);
+    assert.equal(toolResult.index, 4);
+    if (typeof finalActivity !== "object") {
+      assert.fail("expected final assistant activity");
+    }
+    assert.equal(finalActivity.index, 5);
+    assert.equal(finalActivity.activityType, "assistant_final");
+    assert.equal(finalActivity.displayPriority, "final");
+    assert.equal(finalActivity.text, "Assistant final response: Done.");
   });
 
-  it("records every assistant update without dedupe or truncation", () => {
+  it("does not reset indexes when another user message is recorded", () => {
     const facts = new TldrFactCollector();
-    facts.reset("a".repeat(230));
 
-    facts.recordAssistantUpdate(assistantMessage("Step 1"));
-    facts.recordAssistantUpdate(assistantMessage("Step 1"));
-
-    assert.equal(
-      facts.snapshot(),
-      `${`Prompt: ${"a".repeat(230)}`}\nAssistant update: Step 1\nAssistant update: Step 1`,
+    facts.recordUserMessage("First request");
+    facts.recordToolCall(
+      toolCallEvent({ toolName: "bash", toolCallId: "tool-1", input: {} }),
     );
+    const followUp = facts.recordUserMessage("Continue with the same idea");
+
+    assert.deepEqual(followUp, {
+      index: 3,
+      activityType: "user_message",
+      displayPriority: "immediate",
+      text: "User message: Continue with the same idea",
+    });
   });
 
-  it("returns emptyFinalStop and clears stale facts", () => {
+  it("bounds activity text", () => {
     const facts = new TldrFactCollector();
-    facts.reset("TLDR this");
+
+    const activity = facts.recordToolResult(
+      toolResultEvent({
+        toolName: "bash",
+        toolCallId: "tool-1",
+        isError: false,
+        content: [{ type: "text", text: "r".repeat(1_700) }],
+      }),
+    );
+
+    assert.match(activity.text, /^Tool finished: bash \(ok\)\nr+…$/);
+    assert.equal(activity.text.includes("r".repeat(1_700)), false);
+  });
+
+  it("returns activity deltas after a checkpoint index", () => {
+    const facts = new TldrFactCollector();
+
+    facts.recordUserMessage("One");
+    const second = facts.recordToolCall(
+      toolCallEvent({ toolName: "bash", toolCallId: "tool-1", input: {} }),
+    );
+    const third = facts.recordAssistantUpdate(assistantMessage("Working"));
+    facts.recordUserMessage("Two");
+
+    assert.deepEqual(facts.activitiesAfter(1, 3), [second, third]);
+  });
+
+  it("discards raw activity covered by accepted checkpoints", () => {
+    const facts = new TldrFactCollector();
+
+    facts.recordUserMessage("One");
+    facts.recordToolCall(
+      toolCallEvent({ toolName: "bash", toolCallId: "tool-1", input: {} }),
+    );
+    const retained = facts.recordUserMessage("Two");
+
+    facts.discardActivitiesThrough(2);
+
+    assert.deepEqual(facts.activitiesAfter(0, facts.latestActivityIndex()), [
+      retained,
+    ]);
+  });
+
+  it("returns emptyFinalStop without recording activity", () => {
+    const facts = new TldrFactCollector();
+    facts.recordUserMessage("TLDR this");
     facts.recordAssistantUpdate(assistantMessage("Working on it"));
 
     assert.equal(
       facts.recordMessageEnd(assistantMessage("")),
       "emptyFinalStop",
     );
-    assert.equal(facts.snapshot(), "");
+    assert.equal(facts.latestActivityIndex(), 2);
   });
 
   it("ignores tool-use final messages", () => {
     const facts = new TldrFactCollector();
-    facts.reset("TLDR this");
+    facts.recordUserMessage("TLDR this");
 
     assert.equal(
       facts.recordMessageEnd(assistantMessage("", "toolUse")),
       "ignored",
     );
-    assert.equal(facts.snapshot(), "Prompt: TLDR this");
+    assert.equal(facts.latestActivityIndex(), 1);
   });
 
-  it("records final stop text as the only activity fact", () => {
-    const facts = new TldrFactCollector();
-    facts.reset("TLDR this");
-    facts.recordAssistantUpdate(assistantMessage("Working on it"));
-
-    assert.equal(facts.recordMessageEnd(assistantMessage("Done.")), "recorded");
-    assert.equal(
-      facts.snapshot(),
-      "Prompt: TLDR this\nAssistant final response: Done.",
-    );
-  });
-
-  it("records non-stop final reasons with error context", () => {
+  it("records non-stop final reasons as final failure activity", () => {
     const facts = new TldrFactCollector();
     // Safe: this fixture extends the assistant message with the error field
     // consumed for non-stop final reasons.
@@ -191,10 +237,29 @@ describe("TldrFactCollector", () => {
       errorMessage: "Provider failed",
     } as AgentMessage;
 
-    assert.equal(facts.recordMessageEnd(message), "recorded");
-    assert.equal(
-      facts.snapshot(),
-      "Assistant finished with error: Provider failed",
-    );
+    const activity = facts.recordMessageEnd(message);
+
+    if (typeof activity !== "object") {
+      assert.fail("expected final failure activity");
+    }
+    assert.deepEqual(activity, {
+      index: 1,
+      activityType: "assistant_failure",
+      displayPriority: "final",
+      text: "Assistant finished with error: Provider failed",
+    });
+  });
+
+  it("resets conversation state explicitly", () => {
+    const facts = new TldrFactCollector();
+
+    facts.recordUserMessage("One");
+    facts.resetConversation();
+    const activity = facts.recordUserMessage("Two");
+
+    assert.equal(activity.index, 1);
+    assert.deepEqual(facts.activitiesAfter(0, facts.latestActivityIndex()), [
+      activity,
+    ]);
   });
 });

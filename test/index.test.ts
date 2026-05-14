@@ -116,6 +116,31 @@ function waitForMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+interface FakeTheme {
+  fg(_name: string, value: string): string;
+  bold(value: string): string;
+}
+
+type WidgetFactory = (
+  tui: unknown,
+  theme: FakeTheme,
+) => { render(width: number): string[] };
+
+const fakeTheme: FakeTheme = {
+  fg(_name, value) {
+    return value;
+  },
+  bold(value) {
+    return value;
+  },
+};
+
+function renderWidgetText(widget: unknown): string {
+  assert.equal(typeof widget, "function");
+  const component = (widget as WidgetFactory)(undefined, fakeTheme);
+  return component.render(80).join("\n");
+}
+
 interface FakeScheduledTask {
   readonly callback: () => void;
   readonly runAtMs: number;
@@ -365,14 +390,12 @@ describe("piTldr extension entrypoint", () => {
     );
   });
 
-  it("ignores auth from a superseded pending TLDR", async () => {
-    const scheduler = new FakeScheduler();
+  it("processes newer activity after a delayed checkpoint auth resolves", async () => {
     let authCalls = 0;
     let resolveFirstAuth: ((result: FakeAuthResult) => void) | undefined;
     const completionKeys: string[] = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      scheduler,
       now: () => 0,
       generateTldr: async (_model, _context, options) => {
         completionKeys.push(options?.apiKey ?? "");
@@ -394,7 +417,6 @@ describe("piTldr extension entrypoint", () => {
     extension(pi);
     events.get("session_start")?.({}, ctx);
     events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
-    scheduler.advanceBy(0);
     await flushAsyncWork();
 
     assert.equal(authCalls, 1);
@@ -403,13 +425,15 @@ describe("piTldr extension entrypoint", () => {
       { message: assistantResponse("Writing a newer status") },
       ctx,
     );
-    resolveFirstAuth?.({ ok: true, apiKey: "stale-key" });
+
+    assert.equal(authCalls, 1);
+
+    resolveFirstAuth?.({ ok: true, apiKey: "first-key" });
     await flushAsyncWork();
-    scheduler.advanceBy(0);
     await flushAsyncWork();
 
     assert.equal(authCalls, 2);
-    assert.deepEqual(completionKeys, ["fresh-key"]);
+    assert.deepEqual(completionKeys, ["first-key", "fresh-key"]);
   });
 
   it("rechecks automatic fallback auth across agent runs", async () => {
@@ -551,20 +575,70 @@ describe("piTldr extension entrypoint", () => {
     }
   });
 
-  it("coalesces quick tool activity into one TLDR request", async () => {
-    const scheduler = new FakeScheduler();
-    const completionPayloads: string[] = [];
-    const systemPrompts: string[] = [];
+  it("does not display stale checkpoints when newer activity exists", async () => {
+    const widgets: unknown[] = [];
+    const completions: Array<{
+      readonly resolve: (
+        response: ReturnType<typeof assistantResponse>,
+      ) => void;
+    }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      toolActivityCoalesceMs: 20,
-      scheduler,
       now: () => 0,
-      generateTldr: async (_model, context) => {
-        completionPayloads.push(JSON.stringify(context));
-        systemPrompts.push(context.systemPrompt ?? "");
-        return assistantResponse("Checking command results.");
-      },
+      generateTldr: async () =>
+        new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
+          completions.push({ resolve });
+        }),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+
+    events.get("message_update")?.(
+      { message: assistantResponse("Still working") },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    completions[0]?.resolve(assistantResponse("Stale status."));
+    await flushAsyncWork();
+
+    assert.equal(
+      widgets.filter((widget) => typeof widget === "function").length,
+      0,
+    );
+    assert.equal(completions.length, 2);
+
+    completions[1]?.resolve(assistantResponse("Current status."));
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Current status\./);
+  });
+
+  it("generates checkpoint targets for every activity sequentially", async () => {
+    const completions: Array<{
+      readonly context: string;
+      readonly systemPrompt: string;
+      readonly resolve: (
+        response: ReturnType<typeof assistantResponse>,
+      ) => void;
+    }> = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      now: () => 0,
+      generateTldr: async (_model, context) =>
+        new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
+          completions.push({
+            context: JSON.stringify(context),
+            systemPrompt: context.systemPrompt ?? "",
+            resolve,
+          });
+        }),
     });
     const ctx = createFakeContext({});
 
@@ -578,10 +652,17 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
-    scheduler.advanceBy(19);
     await flushAsyncWork();
 
-    assert.equal(completionPayloads.length, 0);
+    assert.equal(completions.length, 1);
+    assert.match(completions[0]?.systemPrompt ?? "", /doing right now/);
+    assert.match(
+      completions[0]?.systemPrompt ?? "",
+      /previous generated TLDR checkpoints/,
+    );
+    assert.match(completions[0]?.context ?? "", /Previous generated TLDR/);
+    assert.match(completions[0]?.context ?? "", /none/);
+    assert.match(completions[0]?.context ?? "", /\[1\] tool_call/);
 
     events.get("tool_result")?.(
       {
@@ -592,73 +673,85 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
-    scheduler.advanceBy(19);
     await flushAsyncWork();
 
-    assert.equal(completionPayloads.length, 0);
+    assert.equal(completions.length, 1);
 
-    scheduler.advanceBy(1);
+    completions[0]?.resolve(assistantResponse("Checking command results."));
     await flushAsyncWork();
 
-    assert.equal(completionPayloads.length, 1);
-    assert.match(systemPrompts[0] ?? "", /doing right now/);
-    assert.match(systemPrompts[0] ?? "", /latest event facts/);
-    assert.match(systemPrompts[0] ?? "", /Do not speak as the assistant/);
-    assert.match(systemPrompts[0] ?? "", /Output only the TLDR sentence/);
-    assert.match(completionPayloads[0] ?? "", /Tool finished: bash/);
-    assert.match(completionPayloads[0] ?? "", /Tests passed/);
+    assert.equal(completions.length, 2);
+    assert.match(
+      completions[1]?.context ?? "",
+      /Through activity 1: Checking command results\./,
+    );
+    assert.doesNotMatch(completions[1]?.context ?? "", /\[1\] tool_call/);
+    assert.match(completions[1]?.context ?? "", /\[2\] tool_result/);
+    assert.match(completions[1]?.context ?? "", /Tests passed/);
   });
 
-  it("lets final TLDRs bypass pending tool coalescing", async () => {
-    const scheduler = new FakeScheduler();
-    const completionPayloads: string[] = [];
+  it("keeps only the latest queued normal checkpoint target", async () => {
+    const completions: Array<{
+      readonly context: string;
+      readonly resolve: (
+        response: ReturnType<typeof assistantResponse>,
+      ) => void;
+    }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      toolActivityCoalesceMs: 50,
-      scheduler,
       now: () => 0,
-      generateTldr: async (_model, context) => {
-        completionPayloads.push(JSON.stringify(context));
-        return assistantResponse("Completed the requested change.");
-      },
+      generateTldr: async (_model, context) =>
+        new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
+          completions.push({ context: JSON.stringify(context), resolve });
+        }),
     });
     const ctx = createFakeContext({});
 
     extension(pi);
     events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+
     events.get("tool_call")?.(
+      { toolName: "bash", toolCallId: "tool-1", input: {} },
+      ctx,
+    );
+    events.get("tool_result")?.(
       {
         toolName: "bash",
         toolCallId: "tool-1",
-        input: { command: "npm test" },
+        isError: false,
+        content: [{ type: "text", text: "Tests passed" }],
       },
       ctx,
     );
-    scheduler.advanceBy(49);
-    await flushAsyncWork();
-
-    assert.equal(completionPayloads.length, 0);
-
-    events.get("message_end")?.(
-      { message: assistantResponse("All done.") },
+    events.get("message_update")?.(
+      { message: assistantResponse("Still working") },
       ctx,
     );
-    scheduler.advanceBy(0);
     await flushAsyncWork();
 
-    assert.equal(completionPayloads.length, 1);
-    assert.match(completionPayloads[0] ?? "", /Assistant final response/);
-    assert.match(completionPayloads[0] ?? "", /All done/);
-    assert.doesNotMatch(completionPayloads[0] ?? "", /Tool started/);
-
-    scheduler.advanceBy(50);
+    completions[0]?.resolve(assistantResponse("Initial status."));
     await flushAsyncWork();
 
-    assert.equal(completionPayloads.length, 1);
+    assert.equal(completions.length, 2);
+    assert.match(
+      completions[1]?.context ?? "",
+      /Through activity 1: Initial status\./,
+    );
+    assert.match(completions[1]?.context ?? "", /\[2\] tool_call/);
+    assert.match(completions[1]?.context ?? "", /\[3\] tool_result/);
+    assert.match(completions[1]?.context ?? "", /\[4\] assistant_update/);
+
+    completions[1]?.resolve(assistantResponse("Latest normal status."));
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 2);
   });
 
-  it("ignores an in-flight tool TLDR after a final TLDR starts", async () => {
-    const scheduler = new FakeScheduler();
+  it("final checkpoints supersede in-flight normal checkpoint generation", async () => {
     const widgets: unknown[] = [];
     const completions: Array<{
       readonly context: string;
@@ -669,8 +762,6 @@ describe("piTldr extension entrypoint", () => {
     }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      toolActivityCoalesceMs: 20,
-      scheduler,
       now: () => 0,
       generateTldr: async (_model, context, options) =>
         new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
@@ -693,41 +784,218 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
-    scheduler.advanceBy(20);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
-    assert.match(completions[0]?.context ?? "", /Tool started: bash/);
     assert.equal(completions[0]?.options?.signal?.aborted, false);
 
     events.get("message_end")?.(
       { message: assistantResponse("All done.") },
       ctx,
     );
-    scheduler.advanceBy(0);
     await flushAsyncWork();
 
-    assert.equal(completions.length, 2);
     assert.equal(completions[0]?.options?.signal?.aborted, true);
+    assert.equal(completions.length, 2);
+    assert.match(completions[1]?.context ?? "", /\[1\] tool_call/);
+    assert.match(completions[1]?.context ?? "", /\[2\] assistant_final/);
     assert.match(completions[1]?.context ?? "", /Assistant final response/);
+
+    completions[0]?.resolve(assistantResponse("Stale normal status."));
+    await flushAsyncWork();
+
+    assert.equal(
+      widgets.filter((widget) => typeof widget === "function").length,
+      0,
+    );
+
+    completions[1]?.resolve(assistantResponse("Final status."));
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Final status\./);
+  });
+
+  it("does not abort in-flight normal checkpoints when newer normal activity queues", async () => {
+    const completions: Array<{
+      readonly context: string;
+      readonly options?: ProviderStreamOptions;
+      readonly resolve: (
+        response: ReturnType<typeof assistantResponse>,
+      ) => void;
+    }> = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      now: () => 0,
+      generateTldr: async (_model, context, options) =>
+        new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
+          completions.push({
+            context: JSON.stringify(context),
+            options,
+            resolve,
+          });
+        }),
+    });
+    const ctx = createFakeContext({});
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("tool_call")?.(
+      {
+        toolName: "bash",
+        toolCallId: "tool-1",
+        input: { command: "npm test" },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+    assert.match(completions[0]?.context ?? "", /\[1\] tool_call/);
+    assert.equal(completions[0]?.options?.signal?.aborted, false);
+
+    events.get("tool_result")?.(
+      {
+        toolName: "bash",
+        toolCallId: "tool-1",
+        isError: false,
+        content: [{ type: "text", text: "Tests passed" }],
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+    assert.equal(completions[0]?.options?.signal?.aborted, false);
 
     completions[0]?.resolve(assistantResponse("Running command output."));
     await flushAsyncWork();
 
-    assert.equal(widgets.length, 1);
-    assert.equal(widgets[0], undefined);
-
-    completions[1]?.resolve(assistantResponse("Completed the task."));
-    await flushAsyncWork();
-
-    assert.equal(widgets.length, 2);
-    assert.equal(typeof widgets[1], "function");
+    assert.equal(completions.length, 2);
+    assert.match(completions[1]?.context ?? "", /\[2\] tool_result/);
   });
 
-  it("renders raw TLDR model output without validation", async () => {
+  it("throttles normal checkpoint display and renders the latest pending checkpoint", async () => {
+    const scheduler = new FakeScheduler();
+    let now = 0;
+    const widgets: unknown[] = [];
+    const outputs = [
+      "Initial status.",
+      "Tool call status.",
+      "Tool result status.",
+    ];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      scheduler,
+      now: () => now,
+      displayUpdateIntervalMs: 1_200,
+      generateTldr: async () => assistantResponse(outputs.shift() ?? ""),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    events.get("tool_call")?.(
+      { toolName: "bash", toolCallId: "tool-1", input: {} },
+      ctx,
+    );
+    await flushAsyncWork();
+    events.get("tool_result")?.(
+      {
+        toolName: "bash",
+        toolCallId: "tool-1",
+        isError: false,
+        content: [{ type: "text", text: "Tests passed" }],
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    scheduler.advanceBy(1_199);
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    now = 1_200;
+    scheduler.advanceBy(1);
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Tool result status\./);
+  });
+
+  it("lets final checkpoints bypass display throttling and clear pending normal output", async () => {
+    const scheduler = new FakeScheduler();
+    let now = 0;
+    const widgets: unknown[] = [];
+    const outputs = ["Initial status.", "Tool call status.", "Final status."];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      scheduler,
+      now: () => now,
+      displayUpdateIntervalMs: 1_200,
+      generateTldr: async () => assistantResponse(outputs.shift() ?? ""),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await flushAsyncWork();
+
+    events.get("tool_call")?.(
+      { toolName: "bash", toolCallId: "tool-1", input: {} },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    events.get("message_end")?.(
+      { message: assistantResponse("All done.") },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Final status\./);
+
+    now = 1_200;
+    scheduler.advanceBy(1_200);
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Final status\./);
+  });
+
+  it("lets immediate user-message checkpoints bypass display throttling", async () => {
     const scheduler = new FakeScheduler();
     const widgets: unknown[] = [];
-    const rawOutputs = [
+    const outputs = ["Initial status.", "Follow-up status."];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      scheduler,
+      now: () => 0,
+      displayUpdateIntervalMs: 1_200,
+      generateTldr: async () => assistantResponse(outputs.shift() ?? ""),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    events.get("before_agent_start")?.({ prompt: "Follow up" }, ctx);
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Follow-up status\./);
+  });
+
+  it("renders non-empty TLDR model output as-is", async () => {
+    const widgets: unknown[] = [];
+    const outputs = [
       "- Inspecting files",
       "[Inspecting](https://example.test)",
       "<status>Inspecting</status>",
@@ -737,9 +1005,8 @@ describe("piTldr extension entrypoint", () => {
     ];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      scheduler,
       now: () => 0,
-      generateTldr: async () => assistantResponse(rawOutputs.shift() ?? ""),
+      generateTldr: async () => assistantResponse(outputs.shift() ?? ""),
     });
     const ctx = createFakeContext({ widgets });
 
@@ -747,13 +1014,32 @@ describe("piTldr extension entrypoint", () => {
     events.get("session_start")?.({}, ctx);
     for (const prompt of ["one", "two", "three", "four", "five", "six"]) {
       events.get("before_agent_start")?.({ prompt }, ctx);
-      scheduler.advanceBy(0);
       await flushAsyncWork();
     }
 
     assert.equal(
       widgets.filter((widget) => typeof widget === "function").length,
       6,
+    );
+  });
+
+  it("does not render empty TLDR model output", async () => {
+    const widgets: unknown[] = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      now: () => 0,
+      generateTldr: async () => assistantResponse(""),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "one" }, ctx);
+    await flushAsyncWork();
+
+    assert.equal(
+      widgets.filter((widget) => typeof widget === "function").length,
+      0,
     );
   });
 
@@ -776,7 +1062,7 @@ describe("piTldr extension entrypoint", () => {
 
     assert.equal(completeCalls.length, 1);
     assert.equal(completeCalls[0]?.options?.cacheRetention, "none");
-    assert.equal(completeCalls[0]?.options?.timeoutMs, 3_000);
+    assert.equal(completeCalls[0]?.options?.timeoutMs, 1_800);
     assert.equal(widgets.length, 3);
     assert.equal(widgets[0], undefined);
     assert.equal(widgets[1], undefined);

@@ -1,9 +1,9 @@
 /**
- * @fileoverview Raw fact collection for model-visible TLDR context.
+ * @fileoverview Indexed activity collection for model-visible TLDR context.
  *
- * This module keeps only the small amount of structure needed to turn pi events
- * into readable context for the TLDR model. It intentionally avoids sanitizing,
- * truncating, normalizing, scoring, or validating text.
+ * This module turns pi events into bounded, readable activity records for the
+ * TLDR model. It does not redact secrets, but it caps activity text so TLDR
+ * requests stay small and predictable.
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
@@ -16,13 +16,44 @@ import type {
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 
+const MAX_ACTIVITY_TEXT_CHARS = 1_500;
+const MAX_RETAINED_RAW_ACTIVITIES = 128;
+
 type TextSourceContent =
   | AssistantMessage["content"][number]
   | TextContent
   | ImageContent;
 
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars - 1)}…`;
+}
+
+/** The source event represented by a TLDR activity record. */
+export type TldrActivityType =
+  | "user_message"
+  | "assistant_update"
+  | "tool_call"
+  | "tool_result"
+  | "assistant_final"
+  | "assistant_failure";
+
+/** How urgently a generated checkpoint for an activity may be displayed. */
+export type TldrDisplayPriority = "immediate" | "normal" | "final";
+
+/** One indexed piece of conversation activity visible to the TLDR model. */
+export interface TldrActivity {
+  readonly index: number;
+  readonly activityType: TldrActivityType;
+  readonly displayPriority: TldrDisplayPriority;
+  readonly text: string;
+}
+
 /** Result of recording an assistant message-end event into TLDR facts. */
-export type MessageEndRecordResult = "recorded" | "emptyFinalStop" | "ignored";
+export type MessageEndRecordResult =
+  | TldrActivity
+  | "emptyFinalStop"
+  | "ignored";
 
 /** Narrows pi agent messages to assistant messages that can produce TLDR facts. */
 function isAssistantMessage(
@@ -57,7 +88,7 @@ export function extractTextContent(
 }
 
 /** Converts a completed assistant message into a final-result fact. */
-function finalFact(message: AssistantMessage): string | undefined {
+function finalActivityText(message: AssistantMessage): string | undefined {
   switch (message.stopReason) {
     case "toolUse":
       return undefined;
@@ -76,57 +107,105 @@ function finalFact(message: AssistantMessage): string | undefined {
   }
 }
 
-/** Narrows optional snapshot lines to lines that should be joined. */
-function isSnapshotLine(line: string | undefined): line is string {
-  return line !== undefined;
+/** Formats an activity as a legacy fact line during the migration. */
+function snapshotLine(activity: TldrActivity): string {
+  return activity.text;
 }
 
 /**
- * Collects model-visible TLDR facts for one active agent run.
+ * Collects indexed model-visible TLDR activities for one conversation.
  *
- * Callers record pi events and request the current raw snapshot. The collector
- * does not clean, truncate, dedupe, or reformat event text beyond brief labels
- * that identify where each piece of context came from.
+ * Callers record pi events and request raw activity deltas by activity index.
+ * Activity text is capped, but this collector does not attempt to detect or
+ * redact secrets.
  */
 export class TldrFactCollector {
-  private prompt = "";
-  private readonly activity: string[] = [];
+  private nextIndex = 1;
+  private readonly activities: TldrActivity[] = [];
+
+  private addActivity(
+    activityType: TldrActivityType,
+    displayPriority: TldrDisplayPriority,
+    text: string,
+  ): TldrActivity {
+    const activity = {
+      index: this.nextIndex,
+      activityType,
+      displayPriority,
+      text: truncateText(text, MAX_ACTIVITY_TEXT_CHARS),
+    } satisfies TldrActivity;
+
+    this.nextIndex++;
+    this.activities.push(activity);
+    if (this.activities.length > MAX_RETAINED_RAW_ACTIVITIES) {
+      this.activities.splice(
+        0,
+        this.activities.length - MAX_RETAINED_RAW_ACTIVITIES,
+      );
+    }
+
+    return activity;
+  }
+
+  /** Clears all conversation activity and restarts activity indexes. */
+  resetConversation(): void {
+    this.nextIndex = 1;
+    this.activities.splice(0);
+  }
 
   /**
-   * Starts a fresh fact collection for a new agent run.
+   * Temporary compatibility wrapper for the old snapshot collector API.
    *
-   * @param prompt Optional user prompt to include as context.
+   * @param prompt Optional user prompt to record as a user-message activity.
    */
   reset(prompt?: string): void {
-    this.prompt = prompt ?? "";
-    this.activity.splice(0);
+    this.resetConversation();
+    if (prompt) this.recordUserMessage(prompt);
+  }
+
+  /** Records a new user message as an immediate TLDR activity boundary. */
+  recordUserMessage(prompt: string): TldrActivity {
+    return this.addActivity(
+      "user_message",
+      "immediate",
+      `User message: ${prompt}`,
+    );
   }
 
   /**
    * Records assistant streaming/update text as in-progress activity.
    *
    * @param message Pi message update event payload.
-   * @returns Whether the message produced a TLDR fact.
+   * @returns The recorded TLDR activity, or undefined for non-assistant/empty messages.
    */
-  recordAssistantUpdate(message: AgentMessage): boolean {
-    if (!isAssistantMessage(message)) return false;
+  recordAssistantUpdate(message: AgentMessage): TldrActivity | undefined {
+    if (!isAssistantMessage(message)) return undefined;
 
     const assistantText = extractTextContent(message.content);
-    if (!assistantText) return false;
+    if (!assistantText) return undefined;
 
-    this.activity.push(`Assistant update: ${assistantText}`);
-    return true;
+    return this.addActivity(
+      "assistant_update",
+      "normal",
+      `Assistant update: ${assistantText}`,
+    );
   }
 
   /** Records a tool call as generic tool activity. */
-  recordToolCall(event: ToolCallEvent): void {
-    this.activity.push(`Tool started: ${event.toolName}`);
+  recordToolCall(event: ToolCallEvent): TldrActivity {
+    return this.addActivity(
+      "tool_call",
+      "normal",
+      `Tool started: ${event.toolName}`,
+    );
   }
 
   /** Records a tool result as generic result activity. */
-  recordToolResult(event: ToolResultEvent): void {
+  recordToolResult(event: ToolResultEvent): TldrActivity {
     const resultText = extractTextContent(event.content);
-    this.activity.push(
+    return this.addActivity(
+      "tool_result",
+      "normal",
       resultText
         ? `Tool finished: ${event.toolName} (${event.isError ? "error" : "ok"})\n${resultText}`
         : `Tool finished: ${event.toolName} (${event.isError ? "error" : "ok"})`,
@@ -137,34 +216,62 @@ export class TldrFactCollector {
    * Records or clears final assistant activity.
    *
    * @param message Final pi agent message.
-   * @returns How the message affected TLDR facts.
+   * @returns The recorded activity, `emptyFinalStop`, or `ignored`.
    */
   recordMessageEnd(message: AgentMessage): MessageEndRecordResult {
     if (!isAssistantMessage(message)) return "ignored";
 
-    const fact = finalFact(message);
-    if (!fact) {
+    const text = finalActivityText(message);
+    if (!text) {
       if (message.stopReason !== "stop") return "ignored";
-      this.reset();
       return "emptyFinalStop";
     }
 
-    this.activity.splice(0);
-    this.activity.push(fact);
-    return "recorded";
+    return this.addActivity(
+      message.stopReason === "stop" ? "assistant_final" : "assistant_failure",
+      "final",
+      text,
+    );
+  }
+
+  /** Returns recorded activities after `previousIndex` through `throughIndex`. */
+  activitiesAfter(
+    previousIndex: number,
+    throughIndex: number,
+  ): readonly TldrActivity[] {
+    return this.activities.filter(
+      (activity) =>
+        activity.index > previousIndex && activity.index <= throughIndex,
+    );
+  }
+
+  /** Returns the latest activity index recorded in this conversation. */
+  latestActivityIndex(): number {
+    return this.nextIndex - 1;
+  }
+
+  /** Discards raw activity already covered by an accepted TLDR checkpoint. */
+  discardActivitiesThrough(activityIndex: number): void {
+    const firstRetainedIndex = this.activities.findIndex(
+      (activity) => activity.index > activityIndex,
+    );
+
+    if (firstRetainedIndex === -1) {
+      this.activities.splice(0);
+      return;
+    }
+
+    if (firstRetainedIndex > 0) {
+      this.activities.splice(0, firstRetainedIndex);
+    }
   }
 
   /**
-   * Returns the current model-visible fact snapshot.
+   * Temporary compatibility snapshot for the current extension flow.
    *
-   * @returns Prompt plus recorded activity, or an empty string when no facts exist.
+   * @returns Joined activity text, or an empty string when no activities exist.
    */
   snapshot(): string {
-    return [
-      this.prompt ? `Prompt: ${this.prompt}` : undefined,
-      ...this.activity,
-    ]
-      .filter(isSnapshotLine)
-      .join("\n");
+    return this.activities.map(snapshotLine).join("\n");
   }
 }

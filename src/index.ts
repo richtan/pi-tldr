@@ -10,7 +10,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createDefaultTimerScheduler,
   createTldrState,
-  DEFAULT_TOOL_ACTIVITY_COALESCE_MS,
+  DEFAULT_DISPLAY_UPDATE_INTERVAL_MS,
   PiTldrDependencies,
   registerTldrExtension,
   TimerScheduler,
@@ -18,7 +18,7 @@ import {
 
 export { PiTldrDependencies, TimerScheduler };
 
-/** Returns the current high-resolution time for TLDR scheduling. */
+/** Returns the production monotonic time for TLDR scheduling. */
 function defaultTldrClock(): number {
   return performance.now();
 }
@@ -34,9 +34,11 @@ export function createPiTldr(
 ): (pi: ExtensionAPI) => void {
   const generateTldr = dependencies.generateTldr ?? complete;
   const now = dependencies.now ?? defaultTldrClock;
-  const toolActivityCoalesceMs = Math.max(
+  const displayUpdateIntervalMs = Math.max(
     0,
-    dependencies.toolActivityCoalesceMs ?? DEFAULT_TOOL_ACTIVITY_COALESCE_MS,
+    dependencies.displayUpdateIntervalMs ??
+      dependencies.toolActivityCoalesceMs ??
+      DEFAULT_DISPLAY_UPDATE_INTERVAL_MS,
   );
   const scheduler = dependencies.scheduler ?? createDefaultTimerScheduler();
 
@@ -45,7 +47,7 @@ export function createPiTldr(
     const state = createTldrState(
       generateTldr,
       now,
-      toolActivityCoalesceMs,
+      displayUpdateIntervalMs,
       scheduler,
     );
 

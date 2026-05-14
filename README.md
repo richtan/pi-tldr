@@ -16,6 +16,14 @@ During a prompt, pi displays a TLDR box like:
 
 The TLDR updates as pi works, including during tool calls and final responses.
 
+## How it works
+
+pi-tldr records each prompt, assistant update, tool call, tool result, and final response as activity. For each activity, it asynchronously asks the selected TLDR model for a generated status checkpoint.
+
+Each checkpoint prompt includes recent generated TLDR checkpoints as compact context plus the new raw activity that has not been summarized yet. Follow-up prompts keep this generated context, so pi-tldr can summarize continuations without starting from scratch.
+
+The widget does not show local fallback summaries. It renders completed model output when available, shows user-prompt and final-response checkpoints immediately, and throttles ordinary activity updates to avoid flicker.
+
 ## Install
 
 Install globally for all pi projects:

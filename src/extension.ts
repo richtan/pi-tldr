@@ -2,10 +2,10 @@
  * @fileoverview pi extension integration, command handling, and TLDR flow.
  *
  * This module is the readable orchestration layer for pi-tldr. It registers the
- * `/tldr` command, listens to pi session/activity events, records raw facts,
- * schedules TLDR model calls, ignores stale async work, and renders the widget.
- * Leaf modules handle fact extraction, model lookup, text extraction, and TUI
- * drawing; the event-to-TLDR flow stays here.
+ * `/tldr` command, listens to pi session/activity events, records indexed
+ * activity, generates rolling TLDR checkpoints, ignores stale async work, and
+ * renders the widget. Leaf modules handle fact extraction, model lookup, text
+ * extraction, and TUI drawing; the event-to-TLDR flow stays here.
  */
 import { complete } from "@earendil-works/pi-ai";
 import type { UserMessage } from "@earendil-works/pi-ai";
@@ -13,7 +13,13 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { extractTextContent, TldrFactCollector } from "./facts.js";
+import {
+  extractTextContent,
+  TldrFactCollector,
+  type TldrActivity,
+  type TldrActivityType,
+  type TldrDisplayPriority,
+} from "./facts.js";
 import {
   formatAuthModelKey,
   formatModelPreference,
@@ -23,19 +29,21 @@ import {
 } from "./models.js";
 import { clearWidget, notifyUser, showWidget } from "./tui.js";
 
-const MODEL_UPDATE_INTERVAL_MS = 1_200;
+const DISPLAY_UPDATE_INTERVAL_MS = 1_200;
 const PROMPT_TARGET_SUMMARY_CHARS = 80;
+const MAX_CONTEXT_CHECKPOINTS = 8;
 const TLDR_MAX_TOKENS = 120;
-const TLDR_REQUEST_TIMEOUT_MS = 3_000;
+const TLDR_REQUEST_TIMEOUT_MS = 1_800;
 
-/** Default delay used to group quick tool call/result bursts into one TLDR. */
-export const DEFAULT_TOOL_ACTIVITY_COALESCE_MS = 300;
+/** Default interval used to throttle ordinary widget display updates. */
+export const DEFAULT_DISPLAY_UPDATE_INTERVAL_MS = DISPLAY_UPDATE_INTERVAL_MS;
 
 const TLDR_SYSTEM_PROMPT = `You write live status TLDRs for a terminal coding agent.
 Return one short, complete, plain-English sentence under ${PROMPT_TARGET_SUMMARY_CHARS} characters.
 The sentence must be complete and must not trail off.
 Describe what the agent is doing right now for the user's task.
-Prioritize the latest event facts; use earlier facts only as context.
+Use previous generated TLDR checkpoints as compressed context.
+Use new raw activity to update the status through the requested activity.
 For in-progress work, start with a present-tense action verb form ending in -ing.
 For final results or completed work, start with a past-tense action verb.
 Do not use first person.
@@ -64,30 +72,42 @@ export interface PiTldrDependencies {
   readonly generateTldr?: TldrModelCall;
   /** Monotonic clock used for TLDR scheduling decisions. */
   readonly now?: TldrClock;
-  /** Delay used to coalesce rapid tool activity into one TLDR request. */
+  /** Interval used to throttle ordinary widget display updates. */
+  readonly displayUpdateIntervalMs?: number;
+  /** Deprecated compatibility alias for the old generation coalescing seam. */
   readonly toolActivityCoalesceMs?: number;
   /** Timer scheduler; overridden by tests for deterministic execution. */
   readonly scheduler?: TimerScheduler;
 }
 
-/** How urgently a fact snapshot should be sent to the TLDR model. */
-type TldrUrgency = "now" | "throttled" | "coalesced";
-
-interface QueuedTldr {
-  readonly snapshot: string;
-  readonly configuredModel?: TldrModelPreference;
+interface TldrCheckpointJob {
+  readonly activityIndex: number;
+  readonly sourceActivityType: TldrActivityType;
+  readonly displayPriority: TldrDisplayPriority;
   readonly runId: number;
   readonly requestId: number;
+}
+
+interface TldrCheckpoint {
+  readonly activityIndex: number;
+  readonly sourceActivityType: TldrActivityType;
+  readonly displayPriority: TldrDisplayPriority;
+  readonly text: string;
+  readonly completedAt: number;
 }
 
 interface TldrWorkState {
   runId: number;
   requestId: number;
-  lastSubmittedFacts: string;
+  latestAcceptedActivityIndex: number;
+  lastRenderedActivityIndex: number;
   lastRenderedTldr: string;
-  lastTldrStartedAt: number;
-  queuedTldr?: QueuedTldr;
-  updateTimer?: unknown;
+  lastDisplayAt: number;
+  checkpointQueue: TldrCheckpointJob[];
+  acceptedCheckpoints: TldrCheckpoint[];
+  inFlightCheckpoint?: TldrCheckpointJob;
+  pendingDisplayCheckpoint?: TldrCheckpoint;
+  displayTimer?: unknown;
   abortController?: AbortController;
 }
 
@@ -97,16 +117,16 @@ export interface TldrState {
   sessionActive: boolean;
   /** Model configured through pi settings, or undefined for automatic selection. */
   configuredModel?: TldrModelPreference;
-  /** Fact collector for the current agent run. */
+  /** Activity collector for the current conversation. */
   readonly facts: TldrFactCollector;
-  /** TLDR scheduling/model-call state. Kept together to make invariants local. */
+  /** TLDR checkpoint/model-call state. Kept together to make invariants local. */
   readonly tldr: TldrWorkState;
   /** Model call used for TLDRs. */
   readonly generateTldr: TldrModelCall;
   /** Monotonic clock used by TLDR scheduling. */
   readonly now: TldrClock;
-  /** Delay used to coalesce rapid tool activity. */
-  readonly toolActivityCoalesceMs: number;
+  /** Interval used to throttle ordinary widget display updates. */
+  readonly displayUpdateIntervalMs: number;
   /** Timer scheduler used by TLDR scheduling. */
   readonly scheduler: TimerScheduler;
 }
@@ -129,7 +149,7 @@ export function createDefaultTimerScheduler(): TimerScheduler {
 export function createTldrState(
   generateTldr: TldrModelCall,
   now: TldrClock,
-  toolActivityCoalesceMs: number,
+  displayUpdateIntervalMs: number,
   scheduler: TimerScheduler,
 ): TldrState {
   return {
@@ -138,13 +158,16 @@ export function createTldrState(
     tldr: {
       runId: 0,
       requestId: 0,
-      lastSubmittedFacts: "",
+      latestAcceptedActivityIndex: 0,
+      lastRenderedActivityIndex: 0,
       lastRenderedTldr: "",
-      lastTldrStartedAt: Number.NEGATIVE_INFINITY,
+      lastDisplayAt: Number.NEGATIVE_INFINITY,
+      checkpointQueue: [],
+      acceptedCheckpoints: [],
     },
     generateTldr,
     now,
-    toolActivityCoalesceMs,
+    displayUpdateIntervalMs,
     scheduler,
   };
 }
@@ -216,7 +239,7 @@ function registerTldrLifecycleHandlers(
   pi.on("session_start", (_event, ctx) => {
     state.sessionActive = true;
     state.configuredModel = resolveInitialModelPreference(ctx.cwd);
-    state.facts.reset();
+    state.facts.resetConversation();
     startFreshTldrRun(state);
     clearWidget(ctx);
   });
@@ -224,43 +247,42 @@ function registerTldrLifecycleHandlers(
   // Ends the current session and prevents pending TLDR work from rendering.
   pi.on("session_shutdown", (_event, ctx) => {
     state.sessionActive = false;
-    state.facts.reset();
+    state.facts.resetConversation();
     startFreshTldrRun(state);
     clearWidget(ctx);
   });
 
-  // Starts a new user-prompt run with the prompt as initial TLDR context.
+  // Records a user prompt as a new conversation activity boundary.
   pi.on("before_agent_start", (event, ctx) => {
     if (!state.sessionActive) return;
 
-    state.facts.reset(event.prompt);
-    startFreshTldrRun(state);
+    const activity = state.facts.recordUserMessage(event.prompt);
     clearWidget(ctx);
-    requestTldr(ctx, state, "now");
+    clearPendingDisplay(state);
+    state.tldr.lastRenderedTldr = "";
+    enqueueCheckpoint(ctx, state, activity);
   });
 
-  // Records streaming assistant progress and rate-limits TLDR updates.
+  // Records streaming assistant progress as normal TLDR activity.
   pi.on("message_update", (event, ctx) => {
     if (!state.sessionActive) return;
-    if (!state.facts.recordAssistantUpdate(event.message)) return;
 
-    requestTldr(ctx, state, "throttled");
+    const activity = state.facts.recordAssistantUpdate(event.message);
+    if (activity) enqueueCheckpoint(ctx, state, activity);
   });
 
-  // Records the beginning of tool activity and coalesces nearby events.
+  // Records the beginning of tool activity.
   pi.on("tool_call", (event, ctx) => {
     if (!state.sessionActive) return;
 
-    state.facts.recordToolCall(event);
-    requestTldr(ctx, state, "coalesced");
+    enqueueCheckpoint(ctx, state, state.facts.recordToolCall(event));
   });
 
-  // Records the result of tool activity and coalesces nearby events.
+  // Records the result of tool activity.
   pi.on("tool_result", (event, ctx) => {
     if (!state.sessionActive) return;
 
-    state.facts.recordToolResult(event);
-    requestTldr(ctx, state, "coalesced");
+    enqueueCheckpoint(ctx, state, state.facts.recordToolResult(event));
   });
 
   // Records final assistant output or clears stale TLDR state for empty output.
@@ -276,11 +298,11 @@ function registerTldrLifecycleHandlers(
       return;
     }
 
-    requestTldr(ctx, state, "now");
+    enqueueCheckpoint(ctx, state, result);
   });
 }
 
-/** Starts a new TLDR run and invalidates earlier queued/model work. */
+/** Starts a new conversation-level TLDR run and invalidates stale model work. */
 function startFreshTldrRun(state: TldrState): void {
   state.tldr.runId++;
   discardCurrentTldr(state);
@@ -288,117 +310,154 @@ function startFreshTldrRun(state: TldrState): void {
 
 /** Clears all TLDR state for a run that should no longer show a TLDR. */
 function discardCurrentTldr(state: TldrState): void {
-  cancelTldrWork(state);
-  state.tldr.lastSubmittedFacts = "";
+  cancelCheckpointWork(state);
+  state.tldr.latestAcceptedActivityIndex = 0;
+  state.tldr.lastRenderedActivityIndex = 0;
   state.tldr.lastRenderedTldr = "";
+  state.tldr.lastDisplayAt = Number.NEGATIVE_INFINITY;
+  state.tldr.acceptedCheckpoints.splice(0);
+  state.tldr.pendingDisplayCheckpoint = undefined;
 }
 
-/** Cancels queued and in-flight model work without clearing rendered/dedupe state. */
-function cancelTldrWork(state: TldrState): void {
+/** Cancels queued and in-flight checkpoint work. */
+function cancelCheckpointWork(state: TldrState): void {
   state.tldr.requestId++;
-  clearUpdateTimer(state);
-  state.tldr.queuedTldr = undefined;
+  clearDisplayTimer(state);
+  state.tldr.checkpointQueue.splice(0);
+  state.tldr.inFlightCheckpoint = undefined;
   state.tldr.abortController?.abort();
   state.tldr.abortController = undefined;
 }
 
-/** Cancels the pending TLDR timer, if one exists. */
-function clearUpdateTimer(state: TldrState): void {
-  if (state.tldr.updateTimer === undefined) return;
+/** Cancels the pending display timer, if one exists. */
+function clearDisplayTimer(state: TldrState): void {
+  if (state.tldr.displayTimer === undefined) return;
 
-  state.scheduler.clearTimeout(state.tldr.updateTimer);
-  state.tldr.updateTimer = undefined;
+  state.scheduler.clearTimeout(state.tldr.displayTimer);
+  state.tldr.displayTimer = undefined;
 }
 
-/** Queues a TLDR model request for the latest fact snapshot. */
-function requestTldr(
+/** Returns whether a checkpoint is important enough to supersede normal work. */
+function isBoundaryCheckpoint(job: TldrCheckpointJob): boolean {
+  return job.displayPriority !== "normal";
+}
+
+/** Removes queued normal checkpoints that have been superseded. */
+function removeQueuedNormalCheckpoints(state: TldrState): void {
+  state.tldr.checkpointQueue = state.tldr.checkpointQueue.filter(
+    (job) => job.displayPriority !== "normal",
+  );
+}
+
+/** Replaces any queued normal checkpoint with the newest normal target. */
+function replaceQueuedNormalCheckpoint(
+  state: TldrState,
+  job: TldrCheckpointJob,
+): void {
+  removeQueuedNormalCheckpoints(state);
+  state.tldr.checkpointQueue.push(job);
+}
+
+/** Aborts in-flight normal work when a boundary checkpoint supersedes it. */
+function abortInFlightNormalCheckpoint(state: TldrState): void {
+  const inFlight = state.tldr.inFlightCheckpoint;
+  if (!inFlight || inFlight.displayPriority !== "normal") return;
+
+  state.tldr.abortController?.abort();
+  state.tldr.abortController = undefined;
+  state.tldr.inFlightCheckpoint = undefined;
+}
+
+/** Enqueues a checkpoint generation job for one recorded activity. */
+function enqueueCheckpoint(
   ctx: ExtensionContext,
   state: TldrState,
-  urgency: TldrUrgency,
+  activity: TldrActivity,
 ): void {
   if (!ctx.hasUI || !state.sessionActive) return;
 
-  const snapshot = state.facts.snapshot();
-  if (!snapshot || snapshot === state.tldr.lastSubmittedFacts) return;
-
-  state.tldr.lastSubmittedFacts = snapshot;
   state.tldr.requestId++;
-  state.tldr.queuedTldr = {
-    snapshot,
-    configuredModel: state.configuredModel,
+  const job = {
+    activityIndex: activity.index,
+    sourceActivityType: activity.activityType,
+    displayPriority: activity.displayPriority,
     runId: state.tldr.runId,
     requestId: state.tldr.requestId,
-  };
+  } satisfies TldrCheckpointJob;
 
-  state.tldr.abortController?.abort();
-  state.tldr.abortController = undefined;
-  clearUpdateTimer(state);
-
-  /** Starts the queued TLDR after its debounce/coalescing delay. */
-  function flushQueuedTldr(): void {
-    state.tldr.updateTimer = undefined;
-    const job = state.tldr.queuedTldr;
-    state.tldr.queuedTldr = undefined;
-    if (job) void runTldrRequest(ctx, state, job);
+  if (isBoundaryCheckpoint(job)) {
+    clearPendingDisplay(state);
+    removeQueuedNormalCheckpoints(state);
+    abortInFlightNormalCheckpoint(state);
+    state.tldr.checkpointQueue.push(job);
+  } else {
+    replaceQueuedNormalCheckpoint(state, job);
   }
 
-  state.tldr.updateTimer = state.scheduler.setTimeout(
-    flushQueuedTldr,
-    tldrDelay(state, urgency),
-  );
+  pumpCheckpointGeneration(ctx, state);
 }
 
-/** Computes when the next TLDR request should run. */
-function tldrDelay(state: TldrState, urgency: TldrUrgency): number {
-  switch (urgency) {
-    case "now":
-      return 0;
-    case "coalesced":
-      return state.toolActivityCoalesceMs;
-    case "throttled":
-      return Math.max(
-        0,
-        MODEL_UPDATE_INTERVAL_MS - (state.now() - state.tldr.lastTldrStartedAt),
-      );
-  }
-}
-
-/** Returns whether queued or in-flight TLDR work still belongs to this run. */
-function isCurrentTldrJob(state: TldrState, job: QueuedTldr): boolean {
-  return (
-    state.sessionActive &&
-    job.runId === state.tldr.runId &&
-    job.requestId === state.tldr.requestId
-  );
-}
-
-/** Calls the TLDR model and renders its raw response if still current. */
-async function runTldrRequest(
+/** Starts the next checkpoint model call if the generation pump is idle. */
+function pumpCheckpointGeneration(
   ctx: ExtensionContext,
   state: TldrState,
-  job: QueuedTldr,
-): Promise<void> {
-  if (!isCurrentTldrJob(state, job)) return;
-
-  let auth;
-  try {
-    auth = await getFastModelAuth(ctx, job.configuredModel);
-  } catch {
+): void {
+  if (!ctx.hasUI || !state.sessionActive || state.tldr.inFlightCheckpoint) {
     return;
   }
 
-  if (!isCurrentTldrJob(state, job) || !auth) return;
+  const job = state.tldr.checkpointQueue.shift();
+  if (!job) return;
+  if (job.runId !== state.tldr.runId) {
+    pumpCheckpointGeneration(ctx, state);
+    return;
+  }
+  if (job.activityIndex <= state.tldr.latestAcceptedActivityIndex) {
+    pumpCheckpointGeneration(ctx, state);
+    return;
+  }
 
-  const abortController = new AbortController();
-  state.tldr.abortController = abortController;
-  state.tldr.lastTldrStartedAt = state.now();
+  state.tldr.inFlightCheckpoint = job;
+  void runCheckpointRequest(ctx, state, job);
+}
+
+/** Returns whether queued or in-flight checkpoint work still belongs here. */
+function isCurrentCheckpointJob(
+  state: TldrState,
+  job: TldrCheckpointJob,
+): boolean {
+  return (
+    state.sessionActive &&
+    job.runId === state.tldr.runId &&
+    state.tldr.inFlightCheckpoint === job
+  );
+}
+
+/** Calls the TLDR model and accepts its generated checkpoint if still current. */
+async function runCheckpointRequest(
+  ctx: ExtensionContext,
+  state: TldrState,
+  job: TldrCheckpointJob,
+): Promise<void> {
+  if (!isCurrentCheckpointJob(state, job)) return;
+
+  let abortController: AbortController | undefined;
 
   try {
+    const prompt = checkpointPrompt(state, job);
+    if (!prompt) return;
+
+    const auth = await getFastModelAuth(ctx, state.configuredModel);
+    if (!isCurrentCheckpointJob(state, job) || !auth) return;
+
+    abortController = new AbortController();
+    state.tldr.abortController = abortController;
+
     const response = await state.generateTldr(
       auth.model,
       {
         systemPrompt: TLDR_SYSTEM_PROMPT,
-        messages: [tldrPrompt(job.snapshot)],
+        messages: [prompt],
       },
       {
         apiKey: auth.apiKey,
@@ -411,35 +470,156 @@ async function runTldrRequest(
       },
     );
 
-    if (!isCurrentTldrJob(state, job)) return;
+    if (!isCurrentCheckpointJob(state, job)) return;
     if (response.stopReason !== "stop") return;
 
-    const tldr = extractTextContent(response.content) ?? "";
-    if (tldr !== state.tldr.lastRenderedTldr) {
-      state.tldr.lastRenderedTldr = tldr;
-      showWidget(ctx, tldr);
-    }
+    const text = extractTextContent(response.content) ?? "";
+    if (!text) return;
+
+    const checkpoint = {
+      activityIndex: job.activityIndex,
+      sourceActivityType: job.sourceActivityType,
+      displayPriority: job.displayPriority,
+      text,
+      completedAt: state.now(),
+    } satisfies TldrCheckpoint;
+
+    acceptCheckpoint(state, checkpoint);
+    considerDisplayingCheckpoint(ctx, state, checkpoint);
   } catch {
-    // TLDRs are best-effort; the next fact snapshot can try again.
+    // TLDRs are best-effort; later checkpoints include unaccepted raw activity.
   } finally {
-    if (state.tldr.abortController === abortController) {
+    if (abortController && state.tldr.abortController === abortController) {
       state.tldr.abortController = undefined;
     }
+    if (state.tldr.inFlightCheckpoint === job) {
+      state.tldr.inFlightCheckpoint = undefined;
+    }
+    pumpCheckpointGeneration(ctx, state);
   }
 }
 
-/** Builds the single user message sent to the TLDR model. */
-function tldrPrompt(snapshot: string): UserMessage {
+/** Accepts a generated checkpoint as compressed context for future prompts. */
+function acceptCheckpoint(state: TldrState, checkpoint: TldrCheckpoint): void {
+  state.tldr.acceptedCheckpoints.push(checkpoint);
+  if (state.tldr.acceptedCheckpoints.length > MAX_CONTEXT_CHECKPOINTS) {
+    state.tldr.acceptedCheckpoints.splice(
+      0,
+      state.tldr.acceptedCheckpoints.length - MAX_CONTEXT_CHECKPOINTS,
+    );
+  }
+  state.tldr.latestAcceptedActivityIndex = checkpoint.activityIndex;
+  state.facts.discardActivitiesThrough(checkpoint.activityIndex);
+}
+
+/** Clears any delayed normal checkpoint waiting for display. */
+function clearPendingDisplay(state: TldrState): void {
+  clearDisplayTimer(state);
+  state.tldr.pendingDisplayCheckpoint = undefined;
+}
+
+/** Applies display policy to an accepted generated checkpoint. */
+function considerDisplayingCheckpoint(
+  ctx: ExtensionContext,
+  state: TldrState,
+  checkpoint: TldrCheckpoint,
+): void {
+  if (checkpoint.activityIndex <= state.tldr.lastRenderedActivityIndex) return;
+  if (checkpoint.activityIndex !== state.facts.latestActivityIndex()) return;
+
+  if (checkpoint.displayPriority !== "normal" || !state.tldr.lastRenderedTldr) {
+    clearPendingDisplay(state);
+    renderCheckpoint(ctx, state, checkpoint);
+    return;
+  }
+
+  const elapsedMs = state.now() - state.tldr.lastDisplayAt;
+  if (elapsedMs >= state.displayUpdateIntervalMs) {
+    clearPendingDisplay(state);
+    renderCheckpoint(ctx, state, checkpoint);
+    return;
+  }
+
+  state.tldr.pendingDisplayCheckpoint = checkpoint;
+  if (state.tldr.displayTimer !== undefined) return;
+
+  state.tldr.displayTimer = state.scheduler.setTimeout(() => {
+    state.tldr.displayTimer = undefined;
+    const pendingCheckpoint = state.tldr.pendingDisplayCheckpoint;
+    state.tldr.pendingDisplayCheckpoint = undefined;
+    if (!pendingCheckpoint || !state.sessionActive) return;
+    if (pendingCheckpoint.activityIndex !== state.facts.latestActivityIndex()) {
+      return;
+    }
+
+    renderCheckpoint(ctx, state, pendingCheckpoint);
+  }, state.displayUpdateIntervalMs - elapsedMs);
+}
+
+/** Renders an accepted checkpoint. */
+function renderCheckpoint(
+  ctx: ExtensionContext,
+  state: TldrState,
+  checkpoint: TldrCheckpoint,
+): void {
+  if (checkpoint.activityIndex <= state.tldr.lastRenderedActivityIndex) return;
+  if (checkpoint.text === state.tldr.lastRenderedTldr) return;
+
+  state.tldr.lastRenderedActivityIndex = checkpoint.activityIndex;
+  state.tldr.lastRenderedTldr = checkpoint.text;
+  state.tldr.lastDisplayAt = state.now();
+  showWidget(ctx, checkpoint.text);
+}
+
+/** Builds the single user message sent to the TLDR model for a checkpoint. */
+function checkpointPrompt(
+  state: TldrState,
+  job: TldrCheckpointJob,
+): UserMessage | undefined {
+  const rawActivities = state.facts.activitiesAfter(
+    state.tldr.latestAcceptedActivityIndex,
+    job.activityIndex,
+  );
+  if (rawActivities.length === 0) return undefined;
+
   return {
     role: "user",
     content: [
       {
         type: "text",
-        text: `Current event facts:\n${snapshot}`,
+        text: [
+          "Previous generated TLDR checkpoints:",
+          previousCheckpointLines(state.tldr.acceptedCheckpoints),
+          "",
+          "New raw activity since the latest accepted checkpoint:",
+          ...rawActivities.map(formatRawActivity),
+          "",
+          `Write the next TLDR through activity ${job.activityIndex}.`,
+        ].join("\n"),
       },
     ],
     timestamp: Date.now(),
   };
+}
+
+/** Formats accepted checkpoints as compressed prompt context. */
+function previousCheckpointLines(
+  checkpoints: readonly TldrCheckpoint[],
+): string {
+  if (checkpoints.length === 0) return "none";
+
+  return checkpoints
+    .slice(-MAX_CONTEXT_CHECKPOINTS)
+    .map(
+      (checkpoint) =>
+        `- Through activity ${checkpoint.activityIndex}: ${checkpoint.text}`,
+    )
+    .join("\n");
+}
+
+/** Formats a raw activity record for the checkpoint prompt. */
+function formatRawActivity(activity: TldrActivity): string {
+  return `[${activity.index}] ${activity.activityType}: ${activity.text}`;
 }
 
 /**
