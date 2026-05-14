@@ -17,7 +17,6 @@ import {
   extractTextContent,
   TldrFactCollector,
   type TldrActivity,
-  type TldrActivityType,
   type TldrDisplayPriority,
 } from "./facts.js";
 import {
@@ -38,20 +37,23 @@ const TLDR_REQUEST_TIMEOUT_MS = 1_800;
 /** Default interval used to throttle ordinary widget display updates. */
 export const DEFAULT_DISPLAY_UPDATE_INTERVAL_MS = DISPLAY_UPDATE_INTERVAL_MS;
 
-const TLDR_SYSTEM_PROMPT = `You write live status TLDRs for a terminal coding agent.
+const TLDR_SYSTEM_PROMPT_PREFIX = `You write live status TLDRs for a terminal coding agent.
 Return one short, complete, plain-English sentence under ${PROMPT_TARGET_SUMMARY_CHARS} characters.
 The sentence must be complete and must not trail off.
 Describe what the agent is doing right now for the user's task.
 Use previous generated TLDR checkpoints as compressed context.
-Use new raw activity to update the status through the requested activity.
-For in-progress work, start with a present-tense action verb form ending in -ing.
-For final results or completed work, start with a past-tense action verb.
-Do not use first person.
+Use new raw activity to update the status through the requested activity.`;
+
+const TLDR_SYSTEM_PROMPT_SUFFIX = `Do not use first person.
 Do not address the user directly.
 Do not speak as the assistant.
 Do not output JSON, markdown, code, logs, diffs, XML, bullet points, or quoted strings.
 Do not mention tool names, command names, raw arguments, or individual file names.
 Output only the TLDR sentence.`;
+
+const IN_PROGRESS_TLDR_INSTRUCTION =
+  "Start with a present-tense action verb form ending in -ing.";
+const FINAL_TLDR_INSTRUCTION = "Start with a past-tense action verb.";
 
 /** Function shape used to call the model that writes TLDR text. */
 export type TldrModelCall = typeof complete;
@@ -82,23 +84,18 @@ export interface PiTldrDependencies {
 
 interface TldrCheckpointJob {
   readonly activityIndex: number;
-  readonly sourceActivityType: TldrActivityType;
   readonly displayPriority: TldrDisplayPriority;
   readonly runId: number;
-  readonly requestId: number;
 }
 
 interface TldrCheckpoint {
   readonly activityIndex: number;
-  readonly sourceActivityType: TldrActivityType;
   readonly displayPriority: TldrDisplayPriority;
   readonly text: string;
-  readonly completedAt: number;
 }
 
 interface TldrWorkState {
   runId: number;
-  requestId: number;
   latestAcceptedActivityIndex: number;
   lastRenderedActivityIndex: number;
   lastRenderedTldr: string;
@@ -157,7 +154,6 @@ export function createTldrState(
     facts: new TldrFactCollector(),
     tldr: {
       runId: 0,
-      requestId: 0,
       latestAcceptedActivityIndex: 0,
       lastRenderedActivityIndex: 0,
       lastRenderedTldr: "",
@@ -293,7 +289,8 @@ function registerTldrLifecycleHandlers(
     if (result === "ignored") return;
 
     if (result === "emptyFinalStop") {
-      discardCurrentTldr(state);
+      state.facts.resetConversation();
+      startFreshTldrRun(state);
       clearWidget(ctx);
       return;
     }
@@ -321,7 +318,6 @@ function discardCurrentTldr(state: TldrState): void {
 
 /** Cancels queued and in-flight checkpoint work. */
 function cancelCheckpointWork(state: TldrState): void {
-  state.tldr.requestId++;
   clearDisplayTimer(state);
   state.tldr.checkpointQueue.splice(0);
   state.tldr.inFlightCheckpoint = undefined;
@@ -335,11 +331,6 @@ function clearDisplayTimer(state: TldrState): void {
 
   state.scheduler.clearTimeout(state.tldr.displayTimer);
   state.tldr.displayTimer = undefined;
-}
-
-/** Returns whether a checkpoint is important enough to supersede normal work. */
-function isBoundaryCheckpoint(job: TldrCheckpointJob): boolean {
-  return job.displayPriority !== "normal";
 }
 
 /** Removes queued normal checkpoints that have been superseded. */
@@ -358,14 +349,21 @@ function replaceQueuedNormalCheckpoint(
   state.tldr.checkpointQueue.push(job);
 }
 
+/** Aborts the current in-flight checkpoint request, if one exists. */
+function abortInFlightCheckpoint(state: TldrState): void {
+  if (!state.tldr.inFlightCheckpoint) return;
+
+  state.tldr.abortController?.abort();
+  state.tldr.abortController = undefined;
+  state.tldr.inFlightCheckpoint = undefined;
+}
+
 /** Aborts in-flight normal work when a boundary checkpoint supersedes it. */
 function abortInFlightNormalCheckpoint(state: TldrState): void {
   const inFlight = state.tldr.inFlightCheckpoint;
   if (!inFlight || inFlight.displayPriority !== "normal") return;
 
-  state.tldr.abortController?.abort();
-  state.tldr.abortController = undefined;
-  state.tldr.inFlightCheckpoint = undefined;
+  abortInFlightCheckpoint(state);
 }
 
 /** Enqueues a checkpoint generation job for one recorded activity. */
@@ -376,16 +374,18 @@ function enqueueCheckpoint(
 ): void {
   if (!ctx.hasUI || !state.sessionActive) return;
 
-  state.tldr.requestId++;
   const job = {
     activityIndex: activity.index,
-    sourceActivityType: activity.activityType,
     displayPriority: activity.displayPriority,
     runId: state.tldr.runId,
-    requestId: state.tldr.requestId,
   } satisfies TldrCheckpointJob;
 
-  if (isBoundaryCheckpoint(job)) {
+  if (job.displayPriority === "immediate") {
+    clearPendingDisplay(state);
+    state.tldr.checkpointQueue.splice(0);
+    abortInFlightCheckpoint(state);
+    state.tldr.checkpointQueue.push(job);
+  } else if (job.displayPriority === "final") {
     clearPendingDisplay(state);
     removeQueuedNormalCheckpoints(state);
     abortInFlightNormalCheckpoint(state);
@@ -456,7 +456,7 @@ async function runCheckpointRequest(
     const response = await state.generateTldr(
       auth.model,
       {
-        systemPrompt: TLDR_SYSTEM_PROMPT,
+        systemPrompt: checkpointSystemPrompt(job),
         messages: [prompt],
       },
       {
@@ -478,10 +478,8 @@ async function runCheckpointRequest(
 
     const checkpoint = {
       activityIndex: job.activityIndex,
-      sourceActivityType: job.sourceActivityType,
       displayPriority: job.displayPriority,
       text,
-      completedAt: state.now(),
     } satisfies TldrCheckpoint;
 
     acceptCheckpoint(state, checkpoint);
@@ -569,6 +567,20 @@ function renderCheckpoint(
   state.tldr.lastRenderedTldr = checkpoint.text;
   state.tldr.lastDisplayAt = state.now();
   showWidget(ctx, checkpoint.text);
+}
+
+/** Builds the system prompt sent to the TLDR model for a checkpoint. */
+function checkpointSystemPrompt(job: TldrCheckpointJob): string {
+  const tenseInstruction =
+    job.displayPriority === "final"
+      ? FINAL_TLDR_INSTRUCTION
+      : IN_PROGRESS_TLDR_INSTRUCTION;
+
+  return [
+    TLDR_SYSTEM_PROMPT_PREFIX,
+    tenseInstruction,
+    TLDR_SYSTEM_PROMPT_SUFFIX,
+  ].join("\n");
 }
 
 /** Builds the single user message sent to the TLDR model for a checkpoint. */

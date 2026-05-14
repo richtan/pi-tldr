@@ -137,6 +137,8 @@ const fakeTheme: FakeTheme = {
 
 function renderWidgetText(widget: unknown): string {
   assert.equal(typeof widget, "function");
+  // Safe: fake pi contexts store widget factories with the same call shape that
+  // the real TUI invokes when rendering a widget.
   const component = (widget as WidgetFactory)(undefined, fakeTheme);
   return component.render(80).join("\n");
 }
@@ -660,6 +662,8 @@ describe("piTldr extension entrypoint", () => {
       completions[0]?.systemPrompt ?? "",
       /previous generated TLDR checkpoints/,
     );
+    assert.match(completions[0]?.systemPrompt ?? "", /present-tense/);
+    assert.doesNotMatch(completions[0]?.systemPrompt ?? "", /past-tense/);
     assert.match(completions[0]?.context ?? "", /Previous generated TLDR/);
     assert.match(completions[0]?.context ?? "", /none/);
     assert.match(completions[0]?.context ?? "", /\[1\] tool_call/);
@@ -755,6 +759,7 @@ describe("piTldr extension entrypoint", () => {
     const widgets: unknown[] = [];
     const completions: Array<{
       readonly context: string;
+      readonly systemPrompt: string;
       readonly options?: ProviderStreamOptions;
       readonly resolve: (
         response: ReturnType<typeof assistantResponse>,
@@ -767,6 +772,7 @@ describe("piTldr extension entrypoint", () => {
         new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
           completions.push({
             context: JSON.stringify(context),
+            systemPrompt: context.systemPrompt ?? "",
             options,
             resolve,
           });
@@ -800,6 +806,8 @@ describe("piTldr extension entrypoint", () => {
     assert.match(completions[1]?.context ?? "", /\[1\] tool_call/);
     assert.match(completions[1]?.context ?? "", /\[2\] assistant_final/);
     assert.match(completions[1]?.context ?? "", /Assistant final response/);
+    assert.match(completions[1]?.systemPrompt ?? "", /past-tense/);
+    assert.doesNotMatch(completions[1]?.systemPrompt ?? "", /present-tense/);
 
     completions[0]?.resolve(assistantResponse("Stale normal status."));
     await flushAsyncWork();
@@ -813,6 +821,78 @@ describe("piTldr extension entrypoint", () => {
     await flushAsyncWork();
 
     assert.match(renderWidgetText(widgets.at(-1)), /Final status\./);
+  });
+
+  it("user-message checkpoints supersede in-flight final checkpoint generation", async () => {
+    const widgets: unknown[] = [];
+    const completions: Array<{
+      readonly context: string;
+      readonly options?: ProviderStreamOptions;
+      readonly resolve: (
+        response: ReturnType<typeof assistantResponse>,
+      ) => void;
+    }> = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      now: () => 0,
+      generateTldr: async (_model, context, options) =>
+        new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
+          completions.push({
+            context: JSON.stringify(context),
+            options,
+            resolve,
+          });
+        }),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+    completions[0]?.resolve(assistantResponse("Initial status."));
+    await flushAsyncWork();
+
+    events.get("message_end")?.(
+      { message: assistantResponse("All done.") },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 2);
+    assert.equal(completions[1]?.options?.signal?.aborted, false);
+
+    events.get("before_agent_start")?.({ prompt: "Follow up" }, ctx);
+    await flushAsyncWork();
+
+    assert.equal(completions[1]?.options?.signal?.aborted, true);
+    assert.equal(completions.length, 3);
+    assert.match(completions[2]?.context ?? "", /User message: Follow up/);
+
+    completions[1]?.resolve(assistantResponse("Stale final status."));
+    await flushAsyncWork();
+
+    assert.equal(widgets.at(-1), undefined);
+
+    completions[2]?.resolve(assistantResponse("Follow-up status."));
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Follow-up status\./);
+
+    events.get("message_update")?.(
+      { message: assistantResponse("Continuing the follow-up") },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 4);
+    assert.doesNotMatch(completions[3]?.context ?? "", /Stale final status/);
+    assert.match(
+      completions[3]?.context ?? "",
+      /Through activity 3: Follow-up status\./,
+    );
   });
 
   it("does not abort in-flight normal checkpoints when newer normal activity queues", async () => {
@@ -1136,13 +1216,15 @@ describe("piTldr extension entrypoint", () => {
     ]);
   });
 
-  it("clears the widget and aborts stale work after an empty final stop", async () => {
+  it("clears stale raw activity after an empty final stop", async () => {
     let abortSignal: AbortSignal | undefined;
     const widgets: unknown[] = [];
+    const completions: Array<{ readonly context: string }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
-      generateTldr: async (_model, _context, options) => {
+      generateTldr: async (_model, context, options) => {
         abortSignal = options?.signal;
+        completions.push({ context: JSON.stringify(context) });
         return new Promise(() => undefined);
       },
     });
@@ -1150,14 +1232,26 @@ describe("piTldr extension entrypoint", () => {
 
     extension(pi);
     events.get("session_start")?.({}, ctx);
-    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    events.get("before_agent_start")?.({ prompt: "First prompt" }, ctx);
     await waitForTimers();
 
     assert.equal(abortSignal?.aborted, false);
 
+    events.get("message_update")?.(
+      { message: assistantResponse("Working on the first prompt") },
+      ctx,
+    );
     events.get("message_end")?.({ message: assistantResponse("") }, ctx);
 
     assert.equal(abortSignal?.aborted, true);
     assert.equal(widgets.at(-1), undefined);
+
+    events.get("before_agent_start")?.({ prompt: "Second prompt" }, ctx);
+    await waitForTimers();
+
+    assert.equal(completions.length, 2);
+    assert.match(completions[1]?.context ?? "", /User message: Second prompt/);
+    assert.doesNotMatch(completions[1]?.context ?? "", /First prompt/);
+    assert.doesNotMatch(completions[1]?.context ?? "", /Working on the first/);
   });
 });

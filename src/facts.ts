@@ -107,11 +107,6 @@ function finalActivityText(message: AssistantMessage): string | undefined {
   }
 }
 
-/** Formats an activity as a legacy fact line during the migration. */
-function snapshotLine(activity: TldrActivity): string {
-  return activity.text;
-}
-
 /**
  * Collects indexed model-visible TLDR activities for one conversation.
  *
@@ -151,16 +146,6 @@ export class TldrFactCollector {
   resetConversation(): void {
     this.nextIndex = 1;
     this.activities.splice(0);
-  }
-
-  /**
-   * Temporary compatibility wrapper for the old snapshot collector API.
-   *
-   * @param prompt Optional user prompt to record as a user-message activity.
-   */
-  reset(prompt?: string): void {
-    this.resetConversation();
-    if (prompt) this.recordUserMessage(prompt);
   }
 
   /** Records a new user message as an immediate TLDR activity boundary. */
@@ -264,14 +249,5 @@ export class TldrFactCollector {
     if (firstRetainedIndex > 0) {
       this.activities.splice(0, firstRetainedIndex);
     }
-  }
-
-  /**
-   * Temporary compatibility snapshot for the current extension flow.
-   *
-   * @returns Joined activity text, or an empty string when no activities exist.
-   */
-  snapshot(): string {
-    return this.activities.map(snapshotLine).join("\n");
   }
 }

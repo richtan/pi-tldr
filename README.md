@@ -1,8 +1,10 @@
 # pi-tldr
 
-A [pi](https://pi.dev) extension that shows a small live `tldr` box above the input bar while the agent works.
+A [pi](https://pi.dev) extension that shows a small live `tldr` box above
+the input bar while the agent works.
 
-It writes a TLDR of what pi is currently doing and keeps the final TLDR visible until the next prompt starts.
+It writes a TLDR of what pi is currently doing and keeps the final TLDR visible
+until the next prompt starts.
 
 ## What it does
 
@@ -18,11 +20,18 @@ The TLDR updates as pi works, including during tool calls and final responses.
 
 ## How it works
 
-pi-tldr records each prompt, assistant update, tool call, tool result, and final response as activity. For each activity, it asynchronously asks the selected TLDR model for a generated status checkpoint.
+pi-tldr records each prompt, assistant update, tool call, tool result, and
+final response as activity. For each activity, it asynchronously asks the
+selected TLDR model for a generated status checkpoint.
 
-Each checkpoint prompt includes recent generated TLDR checkpoints as compact context plus the new raw activity that has not been summarized yet. Follow-up prompts keep this generated context, so pi-tldr can summarize continuations without starting from scratch.
+Each checkpoint prompt includes recent generated TLDR checkpoints as compact
+context plus the new raw activity that has not been summarized yet. Follow-up
+prompts keep this generated context, so pi-tldr can summarize continuations
+without starting from scratch.
 
-The widget does not show local fallback summaries. It renders completed model output when available, shows user-prompt and final-response checkpoints immediately, and throttles ordinary activity updates to avoid flicker.
+The widget does not show local fallback summaries. It renders completed model
+output when available, shows user-prompt and final-response checkpoints
+immediately, and throttles ordinary activity updates to avoid flicker.
 
 ## Install
 
@@ -53,7 +62,8 @@ pi remove npm:pi-tldr
 ## Requirements
 
 - A recent version of pi with package/extension support.
-- At least one configured API key for either your configured TLDR model or an automatic fallback model.
+- At least one configured API key for either your configured TLDR model or an
+  automatic fallback model.
 
 ## TLDR model selection
 
@@ -64,7 +74,8 @@ By default, `auto` tries these fast models in order:
 3. `openai-codex/gpt-5.4-mini`
 4. `openai-codex/gpt-5.3-codex-spark`
 
-If none has a configured API key, the extension stays quiet instead of showing fake fallback text.
+If none has a configured API key, the extension stays quiet instead of showing
+fake fallback text.
 
 To prefer a specific TLDR model, set it in pi settings:
 
@@ -90,7 +101,9 @@ Project-specific settings override user settings. Save project settings in:
 .pi/settings.json
 ```
 
-Set the model to `auto`, omit the setting, or provide an invalid model string to use automatic model selection. If a configured provider/model cannot be found or authenticated, pi-tldr falls back to `auto`.
+Set the model to `auto`, omit the setting, or provide an invalid model string
+to use automatic model selection. If a configured provider/model cannot be
+found or authenticated, pi-tldr falls back to `auto`.
 
 ## Commands
 
@@ -107,7 +120,8 @@ Show available pi-tldr commands:
 
 ### Inspect pi-tldr
 
-Check which model is selected and which model is active after auth/fallback resolution:
+Check which model is selected and which model is active after auth/fallback
+resolution:
 
 ```text
 /tldr status
@@ -121,13 +135,21 @@ selected model: auto
 active model: anthropic/claude-haiku-4-5
 ```
 
-If no supported model is available, the active model is `none`. If auth cannot be checked, the active model is `unknown (auth check failed)`.
+If no supported model is available, the active model is `none`. If auth cannot
+be checked, the active model is `unknown (auth check failed)`.
 
 ## Privacy
 
-pi-tldr sends short snippets from recent prompt, assistant, tool, and result activity to the selected TLDR model provider. This activity is generally already part of the pi agent context, but `auto` may send it to an additional or different provider from your main pi model.
+pi-tldr sends short snippets from recent prompt, assistant, tool, and result
+activity to the selected TLDR model provider. Requests may also include recent
+generated TLDR checkpoint summaries from the current session. This activity is
+generally already part of the pi agent context, but `auto` may send it to an
+additional or different provider from your main pi model.
 
-pi-tldr does not attempt to detect or redact secrets. It disables prompt caching for TLDR requests and keeps snippets short, but this is not a security boundary. Do not use pi-tldr where sending these snippets to the TLDR provider is unacceptable.
+pi-tldr does not attempt to detect or redact secrets. It disables prompt caching
+for TLDR requests and keeps snippets short, but this is not a security boundary.
+Do not use pi-tldr where sending these snippets to the TLDR provider is
+unacceptable.
 
 ## License
 
