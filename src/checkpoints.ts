@@ -432,7 +432,7 @@ export class TldrCheckpointEngine {
 
 /** Builds a system prompt with the checkpoint-specific tense instruction. */
 function tldrSystemPrompt(tenseInstruction: string): string {
-  return `Write one plain-English TLDR for a terminal coding agent.
+  return `Write one plain-English TLDR for a Pi coding agent.
 Use the prior TLDRs for context and the new activity for the update.
 Summarize only activity up to the requested index.
 If context is sparse, still summarize the available activity.

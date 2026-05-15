@@ -657,7 +657,10 @@ describe("piTldr extension entrypoint", () => {
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
-    assert.match(completions[0]?.systemPrompt ?? "", /one plain-English TLDR/);
+    assert.match(
+      completions[0]?.systemPrompt ?? "",
+      /one plain-English TLDR for a Pi coding agent/,
+    );
     assert.match(completions[0]?.systemPrompt ?? "", /prior TLDRs for context/);
     assert.match(completions[0]?.systemPrompt ?? "", /requested index/);
     assert.match(
