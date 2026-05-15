@@ -31,3 +31,6 @@ pnpm-debug.log*
 # Agent-local instructions and task notes
 AGENTS.md
 tasks/
+
+# Local security scanning workspace
+.deepsec/
