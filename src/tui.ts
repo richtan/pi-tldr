@@ -12,6 +12,7 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { sanitizeTldrText } from "./sanitize.js";
 
 const WIDGET_KEY = "pi-tldr";
 const TITLE = " tldr ";
@@ -97,8 +98,14 @@ export function clearWidget(ctx: ExtensionContext): void {
 export function showWidget(ctx: ExtensionContext, tldr: string): void {
   if (!ctx.hasUI) return;
 
+  const safeTldr = sanitizeTldrText(tldr);
+  if (!safeTldr) {
+    clearWidget(ctx);
+    return;
+  }
+
   // pi calls this factory when rendering the widget.
-  ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => new PiTldrBox(theme, tldr));
+  ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => new PiTldrBox(theme, safeTldr));
 }
 
 /** Sends a user-visible pi notification when a UI is available. */

@@ -16,6 +16,7 @@ import {
   type TldrDisplayPriority,
 } from "./facts.js";
 import { getFastModelAuth, type TldrModelPreference } from "./models.js";
+import { sanitizeTldrText } from "./sanitize.js";
 import { showWidget } from "./tui.js";
 
 const PROMPT_TARGET_SUMMARY_CHARS = 80;
@@ -305,7 +306,7 @@ export class TldrCheckpointEngine {
       if (!this.isCurrentCheckpointJob(job)) return;
       if (response.stopReason !== "stop") return;
 
-      const text = extractTextContent(response.content) ?? "";
+      const text = sanitizeTldrText(extractTextContent(response.content) ?? "");
       if (!text) return;
 
       const checkpoint = {

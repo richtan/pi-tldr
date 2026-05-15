@@ -1109,6 +1109,36 @@ describe("piTldr extension entrypoint", () => {
     );
   });
 
+  it("sanitizes TLDR model output before rendering", async () => {
+    const widgets: unknown[] = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      now: () => 0,
+      generateTldr: async () =>
+        assistantResponse(
+          [
+            "\u001b]52;c;Y2xpcGJvYXJk\u0007",
+            "\u001b[31mInspecting\u001b[0m",
+            "files\u0000",
+            "\u001b]8;;https://evil.test\u001b\\link\u001b]8;;\u001b\\",
+          ].join("\n"),
+        ),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "one" }, ctx);
+    await flushAsyncWork();
+
+    const rendered = renderWidgetText(widgets.at(-1));
+    assert.match(rendered, /Inspecting files link/);
+    assert.doesNotMatch(
+      rendered,
+      /\u001b|\u0000|\u0007|evil\.test|Y2xpcGJvYXJk/,
+    );
+  });
+
   it("does not render empty TLDR model output", async () => {
     const widgets: unknown[] = [];
     const { pi, events } = createFakePiHarness();
