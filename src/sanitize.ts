@@ -6,19 +6,18 @@
  * module removes terminal controls before text reaches pi-tui.
  */
 
-/** Maximum printable characters accepted for one rendered TLDR. */
+// The widget should stay glanceable even if the TLDR model ignores the prompt's
+// sentence-length instruction.
 export const MAX_SAFE_TLDR_CHARS = 240;
 
 const ESC = 0x1b;
 const BEL = 0x07;
 const ST = 0x9c;
 
-/** Returns true for C0/C1 control characters that should never render. */
 function isControlCharacter(code: number): boolean {
   return (code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f);
 }
 
-/** Returns true for whitespace controls that should become ordinary spaces. */
 function isWhitespaceControl(code: number): boolean {
   return (
     code === 0x09 ||
@@ -29,7 +28,6 @@ function isWhitespaceControl(code: number): boolean {
   );
 }
 
-/** Skips a CSI control sequence starting just after its introducer. */
 function skipCsiSequence(text: string, startIndex: number): number {
   for (let index = startIndex; index < text.length; index++) {
     const code = text.charCodeAt(index);
@@ -39,7 +37,6 @@ function skipCsiSequence(text: string, startIndex: number): number {
   return text.length;
 }
 
-/** Skips OSC/DCS/APC/PM/SOS string controls starting after their introducer. */
 function skipStringControl(text: string, startIndex: number): number {
   for (let index = startIndex; index < text.length; index++) {
     const code = text.charCodeAt(index);
@@ -52,7 +49,6 @@ function skipStringControl(text: string, startIndex: number): number {
   return text.length;
 }
 
-/** Skips short ESC controls such as charset designators and RIS. */
 function skipEscapeSequence(text: string, escapeIndex: number): number {
   const nextCode = text.charCodeAt(escapeIndex + 1);
   if (Number.isNaN(nextCode)) return escapeIndex + 1;
@@ -80,7 +76,6 @@ function skipEscapeSequence(text: string, escapeIndex: number): number {
   }
 }
 
-/** Truncates printable text to a code-point cap, preserving valid Unicode. */
 function truncatePrintableText(text: string, maxChars: number): string {
   if (maxChars <= 0) return "";
 

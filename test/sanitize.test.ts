@@ -1,6 +1,3 @@
-/**
- * @fileoverview Tests for terminal-safe TLDR text sanitization.
- */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { sanitizeTldrText } from "../src/sanitize.js";

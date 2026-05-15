@@ -10,7 +10,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 
-/** Creates model metadata used by pi-tldr tests. */
 export function fakeModel(
   provider = "anthropic",
   id = "claude-haiku-4-5",
@@ -30,7 +29,6 @@ export function fakeModel(
   } as Model<Api>;
 }
 
-/** Creates an assistant response consumed by pi-tldr TLDR tests. */
 export function assistantResponse(
   text: string,
   stopReason: AssistantMessage["stopReason"] = "stop",
@@ -52,7 +50,6 @@ export function assistantResponse(
   } as AssistantMessage;
 }
 
-/** Writes tldr model settings below a test root. */
 export function writeModelSettings(
   root: string,
   relativeDir: string,
@@ -67,7 +64,6 @@ export function writeModelSettings(
   );
 }
 
-/** Creates a temporary cwd containing project-local tldr model settings. */
 export function createSettingsCwd(model: string): string {
   const cwd = mkdtempSync(join(tmpdir(), "pi-tldr-settings-"));
   writeModelSettings(cwd, ".pi", model);

@@ -24,25 +24,25 @@ const MAX_CONTEXT_CHECKPOINTS = 8;
 const TLDR_MAX_TOKENS = 120;
 const TLDR_REQUEST_TIMEOUT_MS = 2_000;
 const TOOL_PROGRESS_DISPLAY_UPDATE_INTERVAL_MS = 10_000;
+
+// Ordinary activity should feel responsive without turning rapid read/grep/edit
+// bursts into a model-request ticker. The quiet window catches short bursts;
+// the max wait ensures continuous activity still surfaces progress.
 const NORMAL_CHECKPOINT_QUIET_MS = 700;
 const NORMAL_CHECKPOINT_MAX_WAIT_MS = 2_500;
 
-/** Default interval used to throttle ordinary widget display updates. */
 export const DEFAULT_DISPLAY_UPDATE_INTERVAL_MS = 1_200;
 
 const IN_PROGRESS_TLDR_INSTRUCTION = "Start with a present-tense -ing verb.";
 const COMPLETED_TLDR_INSTRUCTION = "Start with a past-tense verb.";
 
-/** Function shape used to call the model that writes TLDR text. */
 export type TldrModelCall = typeof complete;
-/** Function shape used to read monotonic time for TLDR scheduling. */
 export type TldrClock = () => number;
 
-/** Timer boundary used to make TLDR scheduling deterministic in tests. */
+// Timer handles differ between Node and fake test schedulers, so the engine
+// treats them as opaque tokens and keeps scheduling policy injectable.
 export interface TimerScheduler {
-  /** Schedules a callback after the requested delay. */
   setTimeout(callback: () => void, delayMs: number): unknown;
-  /** Cancels a timer returned by {@link setTimeout}. */
   clearTimeout(handle: unknown): void;
 }
 
@@ -81,26 +81,18 @@ interface TldrWorkState {
 }
 
 export interface TldrCheckpointEngineOptions {
-  /** Activity log that supplies raw delta context and accepts pruning. */
   readonly facts: TldrFactCollector;
-  /** Model call used to ask the TLDR model for text. */
   readonly generateTldr: TldrModelCall;
-  /** Monotonic clock used for TLDR scheduling decisions. */
   readonly now: TldrClock;
-  /** Interval used to throttle ordinary widget display updates. */
   readonly displayUpdateIntervalMs: number;
-  /** Timer scheduler; overridden by tests for deterministic execution. */
   readonly scheduler: TimerScheduler;
 }
 
-/** Creates the production timer scheduler backed by Node timers. */
 export function createDefaultTimerScheduler(): TimerScheduler {
   return {
-    /** Schedules TLDR work with Node's timer API. */
     setTimeout(callback, delayMs) {
       return setTimeout(callback, delayMs);
     },
-    /** Cancels TLDR work scheduled with Node's timer API. */
     clearTimeout(handle) {
       clearTimeout(handle as ReturnType<typeof setTimeout>);
     },
@@ -139,23 +131,19 @@ export class TldrCheckpointEngine {
     this.scheduler = options.scheduler;
   }
 
-  /** Model configured through pi settings, or undefined for automatic choice. */
   selectedModel(): TldrModelPreference | undefined {
     return this.configuredModel;
   }
 
-  /** Updates the model preference used by future checkpoint requests. */
   selectModel(model?: TldrModelPreference): void {
     this.configuredModel = model;
   }
 
-  /** Starts a new conversation-level TLDR run and invalidates stale model work. */
   startFreshRun(): void {
     this.work.runId++;
     this.discardCurrentTldr();
   }
 
-  /** Enqueues a checkpoint generation job for one recorded activity. */
   enqueue(ctx: ExtensionContext, activity: TldrActivity): void {
     if (!ctx.hasUI) return;
 
@@ -188,7 +176,6 @@ export class TldrCheckpointEngine {
     this.pumpCheckpointGeneration(ctx);
   }
 
-  /** Clears all TLDR state for a run that should no longer show a TLDR. */
   private discardCurrentTldr(): void {
     this.cancelCheckpointWork();
     this.work.latestAcceptedActivityIndex = 0;
@@ -200,7 +187,6 @@ export class TldrCheckpointEngine {
     this.work.pendingDisplayCheckpoint = undefined;
   }
 
-  /** Cancels queued and in-flight checkpoint work. */
   private cancelCheckpointWork(): void {
     this.clearDisplayTimer();
     this.clearPendingNormalCheckpoint();
@@ -210,18 +196,15 @@ export class TldrCheckpointEngine {
     this.work.abortController = undefined;
   }
 
-  /** Clears any delayed normal checkpoint waiting for display. */
   private clearPendingDisplay(): void {
     this.clearDisplayTimer();
     this.work.pendingDisplayCheckpoint = undefined;
   }
 
-  /** Allows a new user turn to display the same TLDR text again if regenerated. */
   private forgetRenderedText(): void {
     this.work.lastRenderedTldr = "";
   }
 
-  /** Cancels the pending display timer, if one exists. */
   private clearDisplayTimer(): void {
     if (this.work.displayTimer === undefined) return;
 
@@ -229,7 +212,6 @@ export class TldrCheckpointEngine {
     this.work.displayTimer = undefined;
   }
 
-  /** Cancels the pending normal-generation timer, if one exists. */
   private clearNormalCheckpointTimer(): void {
     if (this.work.normalCheckpointTimer === undefined) return;
 
@@ -237,14 +219,12 @@ export class TldrCheckpointEngine {
     this.work.normalCheckpointTimer = undefined;
   }
 
-  /** Clears buffered normal activity that has not yet become a model request. */
   private clearPendingNormalCheckpoint(): void {
     this.clearNormalCheckpointTimer();
     this.work.pendingNormalCheckpoint = undefined;
     this.work.normalCheckpointBurstStartedAt = undefined;
   }
 
-  /** Buffers rapid normal activity until it quiets down or reaches max wait. */
   private scheduleNormalCheckpoint(
     ctx: ExtensionContext,
     job: TldrCheckpointJob,
@@ -273,7 +253,6 @@ export class TldrCheckpointEngine {
     }, delayMs);
   }
 
-  /** Turns the latest debounced normal activity into a checkpoint job. */
   private flushPendingNormalCheckpoint(ctx: ExtensionContext): void {
     const job = this.work.pendingNormalCheckpoint;
     this.clearPendingNormalCheckpoint();
@@ -283,20 +262,17 @@ export class TldrCheckpointEngine {
     this.pumpCheckpointGeneration(ctx);
   }
 
-  /** Removes queued normal checkpoints that have been superseded. */
   private removeQueuedNormalCheckpoints(): void {
     this.work.checkpointQueue = this.work.checkpointQueue.filter(
       (job) => job.displayPriority !== "normal",
     );
   }
 
-  /** Replaces any queued normal checkpoint with the newest normal target. */
   private replaceQueuedNormalCheckpoint(job: TldrCheckpointJob): void {
     this.removeQueuedNormalCheckpoints();
     this.work.checkpointQueue.push(job);
   }
 
-  /** Aborts the current in-flight checkpoint request, if one exists. */
   private abortInFlightCheckpoint(): void {
     if (!this.work.inFlightCheckpoint) return;
 
@@ -305,7 +281,6 @@ export class TldrCheckpointEngine {
     this.work.inFlightCheckpoint = undefined;
   }
 
-  /** Aborts in-flight normal work when a boundary checkpoint supersedes it. */
   private abortInFlightNormalCheckpoint(): void {
     const inFlight = this.work.inFlightCheckpoint;
     if (!inFlight || inFlight.displayPriority !== "normal") return;
@@ -313,7 +288,6 @@ export class TldrCheckpointEngine {
     this.abortInFlightCheckpoint();
   }
 
-  /** Starts the next checkpoint model call if the generation pump is idle. */
   private pumpCheckpointGeneration(ctx: ExtensionContext): void {
     if (!ctx.hasUI || this.work.inFlightCheckpoint) return;
 
@@ -332,14 +306,12 @@ export class TldrCheckpointEngine {
     void this.runCheckpointRequest(ctx, job);
   }
 
-  /** Returns whether queued or in-flight checkpoint work still belongs here. */
   private isCurrentCheckpointJob(job: TldrCheckpointJob): boolean {
     return (
       job.runId === this.work.runId && this.work.inFlightCheckpoint === job
     );
   }
 
-  /** Calls the TLDR model and accepts its generated checkpoint if still current. */
   private async runCheckpointRequest(
     ctx: ExtensionContext,
     job: TldrCheckpointJob,
@@ -404,7 +376,6 @@ export class TldrCheckpointEngine {
     }
   }
 
-  /** Accepts a generated checkpoint as compressed context for future prompts. */
   private acceptCheckpoint(checkpoint: TldrCheckpoint): void {
     this.work.acceptedCheckpoints.push(checkpoint);
     if (this.work.acceptedCheckpoints.length > MAX_CONTEXT_CHECKPOINTS) {
@@ -417,7 +388,6 @@ export class TldrCheckpointEngine {
     this.facts.discardActivitiesThrough(checkpoint.activityIndex);
   }
 
-  /** Applies display policy to an accepted generated checkpoint. */
   private considerDisplayingCheckpoint(
     ctx: ExtensionContext,
     checkpoint: TldrCheckpoint,
@@ -459,7 +429,6 @@ export class TldrCheckpointEngine {
     }, displayIntervalMs - elapsedMs);
   }
 
-  /** Returns whether an accepted checkpoint is too stale to render. */
   private shouldDropStaleCheckpoint(checkpoint: TldrCheckpoint): boolean {
     // Current checkpoints are always renderable; there is no newer activity that
     // could make their TLDR misleading.
@@ -495,7 +464,6 @@ export class TldrCheckpointEngine {
     );
   }
 
-  /** Returns the display coalescing interval for a checkpoint. */
   private displayIntervalFor(checkpoint: TldrCheckpoint): number {
     if (!isToolProgressActivity(checkpoint.activityType)) {
       return this.displayUpdateIntervalMs;
@@ -507,7 +475,6 @@ export class TldrCheckpointEngine {
       : this.displayUpdateIntervalMs;
   }
 
-  /** Renders an accepted checkpoint. */
   private renderCheckpoint(
     ctx: ExtensionContext,
     checkpoint: TldrCheckpoint,
@@ -526,7 +493,6 @@ export class TldrCheckpointEngine {
     showWidget(ctx, checkpoint.text);
   }
 
-  /** Builds the single user message sent to the TLDR model for a checkpoint. */
   private checkpointPrompt(job: TldrCheckpointJob): UserMessage | undefined {
     const rawActivities = this.facts.activitiesAfter(
       this.work.latestAcceptedActivityIndex,
@@ -555,7 +521,6 @@ export class TldrCheckpointEngine {
   }
 }
 
-/** Builds a system prompt with the checkpoint-specific tense instruction. */
 function tldrSystemPrompt(tenseInstruction: string): string {
   return `Write one plain-English TLDR for a Pi coding agent.
 Use the prior TLDRs for context and the new activity for the update.
@@ -571,7 +536,6 @@ Plain text only; no markdown, JSON, code, bullets, quotes, or file/tool names.
 ${tenseInstruction}`;
 }
 
-/** Builds the system prompt sent to the TLDR model for a checkpoint. */
 function checkpointSystemPrompt(job: TldrCheckpointJob): string {
   const tenseInstruction = usesCompletedTense(job.activityType)
     ? COMPLETED_TLDR_INSTRUCTION
@@ -580,7 +544,6 @@ function checkpointSystemPrompt(job: TldrCheckpointJob): string {
   return tldrSystemPrompt(tenseInstruction);
 }
 
-/** Returns whether an activity describes completed work. */
 function usesCompletedTense(
   activityType: TldrActivity["activityType"],
 ): boolean {
@@ -593,7 +556,6 @@ function usesCompletedTense(
   );
 }
 
-/** Returns whether an activity can stream frequent progress updates. */
 function isToolProgressActivity(
   activityType: TldrActivity["activityType"],
 ): boolean {
@@ -603,7 +565,6 @@ function isToolProgressActivity(
   );
 }
 
-/** Formats accepted checkpoints as compressed prompt context. */
 function previousCheckpointLines(
   checkpoints: readonly TldrCheckpoint[],
 ): string {
@@ -618,7 +579,6 @@ function previousCheckpointLines(
     .join("\n");
 }
 
-/** Formats a raw activity record for the checkpoint prompt. */
 function formatRawActivity(activity: TldrActivity): string {
   return `[${activity.index}] ${activity.activityType}: ${activity.text}`;
 }

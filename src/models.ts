@@ -11,25 +11,19 @@ import { SettingsManager } from "@earendil-works/pi-coding-agent";
 
 const SETTINGS_KEY = "tldr";
 
-/** Provider/model choice for TLDR completions. */
 export interface TldrModelPreference {
-  /** Model provider name as registered with pi. */
   readonly provider: string;
-  /** Provider-local model id. */
   readonly id: string;
 }
 
-/** Authenticated model selected for one TLDR completion. */
 export interface FastModelAuth {
-  /** Model metadata from pi's model registry. */
   readonly model: Model<Api>;
-  /** API key to pass to the provider. */
   readonly apiKey: string;
-  /** Optional provider headers returned by pi's auth registry. */
   readonly headers?: Record<string, string>;
 }
 
-/** Fast models tried when the user has not configured a TLDR model. */
+// The TLDR path optimizes for low latency and low cost rather than reasoning
+// quality; these are deliberately fast fallback models already known to pi.
 const FAST_MODEL_CANDIDATES: readonly TldrModelPreference[] = [
   { provider: "anthropic", id: "claude-haiku-4-5" },
   { provider: "anthropic", id: "claude-haiku-4-5-20251001" },
@@ -37,25 +31,17 @@ const FAST_MODEL_CANDIDATES: readonly TldrModelPreference[] = [
   { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
 ];
 
-/** Parsed presence/value state for the `tldr.model` setting. */
 interface SettingsModelValue {
   readonly present: boolean;
   readonly value?: string;
 }
 
-/**
- * Formats a selected model for user-visible status output.
- *
- * @param configuredModel Configured model, or undefined for automatic selection.
- * @returns `provider/id` or `auto`.
- */
 export function formatModelPreference(
   configuredModel?: TldrModelPreference,
 ): string {
   return configuredModel ? formatTldrModelKey(configuredModel) : "auto";
 }
 
-/** Formats a model preference as `provider/id`. */
 export function formatTldrModelKey({
   provider,
   id,
@@ -63,7 +49,6 @@ export function formatTldrModelKey({
   return `${provider}/${id}`;
 }
 
-/** Formats authenticated model metadata as `provider/id`. */
 export function formatAuthModelKey(auth: FastModelAuth): string {
   return `${auth.model.provider}/${auth.model.id}`;
 }
@@ -91,7 +76,6 @@ function parseModelSpec(value: string): TldrModelPreference | undefined {
   };
 }
 
-/** Extracts an optional model setting from parsed settings. */
 function settingsModelValue(
   settings: Record<string, unknown>,
   key: string,
@@ -107,16 +91,8 @@ function settingsModelValue(
     : { present: "model" in section };
 }
 
-/**
- * Resolves the configured model from pi settings.
- *
- * Pi's `SettingsManager` owns global and project settings path resolution. Its
- * project scope is `<cwd>/.pi/settings.json`, so callers should pass the pi
- * session's project working directory.
- *
- * @param cwd Current pi working directory used for project settings.
- * @returns Configured model preference, or undefined for automatic selection.
- */
+// SettingsManager owns global/project lookup. Passing pi's session cwd lets
+// project-local `.pi/settings.json` override user-wide TLDR settings.
 export function resolveInitialModelPreference(
   cwd: string,
 ): TldrModelPreference | undefined {
@@ -136,7 +112,6 @@ export function resolveInitialModelPreference(
   return userModel.value ? parseModelSpec(userModel.value) : undefined;
 }
 
-/** Returns auth for one exact model preference, or undefined if unavailable. */
 async function getModelAuth(
   ctx: ExtensionContext,
   modelPreference: TldrModelPreference,
@@ -155,13 +130,6 @@ async function getModelAuth(
     : undefined;
 }
 
-/**
- * Finds the first available authenticated TLDR model.
- *
- * @param ctx pi extension context containing model registry/auth access.
- * @param configuredModel Optional configured model to try before fallbacks.
- * @returns Authenticated model info, or undefined when no candidate is usable.
- */
 export async function getFastModelAuth(
   ctx: ExtensionContext,
   configuredModel?: TldrModelPreference,

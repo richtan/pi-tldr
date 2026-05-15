@@ -62,7 +62,6 @@ function truncateText(text: string, maxChars: number): string {
   return `${head}…${tail}`;
 }
 
-/** The source event represented by a TLDR activity record. */
 export type TldrActivityType =
   | "user_message"
   | "assistant_update"
@@ -77,10 +76,8 @@ export type TldrActivityType =
   | "assistant_final"
   | "assistant_failure";
 
-/** How urgently a generated checkpoint for an activity may be displayed. */
 export type TldrDisplayPriority = "immediate" | "normal" | "final";
 
-/** One indexed piece of conversation activity visible to the TLDR model. */
 export interface TldrActivity {
   readonly index: number;
   readonly activityType: TldrActivityType;
@@ -89,42 +86,35 @@ export interface TldrActivity {
   readonly progressGroup?: string;
 }
 
-/** Result of recording an assistant message-end event into TLDR facts. */
 export type MessageEndRecordResult =
   | TldrActivity
   | "emptyFinalStop"
   | "ignored";
 
-/** Narrows pi agent messages to assistant messages that can produce TLDR facts. */
 function isAssistantMessage(
   message: AgentMessage,
 ): message is AssistantMessage {
   return "role" in message && message.role === "assistant";
 }
 
-/** Narrows mixed pi content blocks to text blocks. */
 function isTextContent(content: TextSourceContent): content is TextContent {
   return content.type === "text";
 }
 
-/** Returns the string payload from a text content block. */
 function textBlockValue(content: TextContent): string {
   return content.text;
 }
 
-/** Narrows arbitrary event payload fields to records. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-/** Narrows unknown tool payload blocks to text content. */
 function isUnknownTextContent(value: unknown): value is TextContent {
   return (
     isRecord(value) && value.type === "text" && typeof value.text === "string"
   );
 }
 
-/** Narrows assistant content blocks to completed or partial tool calls. */
 function isToolCallContent(value: unknown): value is ToolCall {
   return (
     isRecord(value) &&
@@ -135,7 +125,6 @@ function isToolCallContent(value: unknown): value is ToolCall {
   );
 }
 
-/** Returns the tool call currently represented by an assistant stream event. */
 function toolCallAtContentIndex(
   message: AssistantMessage,
   contentIndex: number,
@@ -144,7 +133,6 @@ function toolCallAtContentIndex(
   return isToolCallContent(content) ? content : undefined;
 }
 
-/** Extracts text blocks from unknown tool execution payload content. */
 function extractTextFromUnknownContent(content: unknown): string | undefined {
   if (!Array.isArray(content)) return undefined;
 
@@ -154,7 +142,9 @@ function extractTextFromUnknownContent(content: unknown): string | undefined {
     : undefined;
 }
 
-/** Converts arbitrary tool execution payloads into bounded activity text input. */
+// Pi tool payloads are not normalized across every event path. Prefer the
+// human-readable `content`/`text` shapes when present, then fall back to JSON so
+// the TLDR model still has something useful for custom tool payloads.
 function formatUnknownPayload(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value === "string") return value;
@@ -174,7 +164,6 @@ function formatUnknownPayload(value: unknown): string | undefined {
   }
 }
 
-/** Appends an optional payload on a new line. */
 function appendPayload(prefix: string, payload: unknown): string {
   const payloadText = formatUnknownPayload(payload);
   return payloadText ? `${prefix}\n${payloadText}` : prefix;
@@ -192,7 +181,8 @@ interface ToolInputActivityResult {
   readonly progressGroup?: string;
 }
 
-/** Builds a stable key for a streamed tool-call input block. */
+// Some streamed tool-call deltas arrive before the final call id is available;
+// content index is the best stable anchor until the id appears.
 function toolInputAnchorKey(
   contentIndex: number,
   toolCall: ToolCall | undefined,
@@ -200,12 +190,10 @@ function toolInputAnchorKey(
   return toolCall?.id ?? `content:${contentIndex}`;
 }
 
-/** Formats an update as context for the original action. */
 function anchoredUpdateText(anchorText: string, updateText: string): string {
   return `Main action: ${anchorText}\nUpdate context: ${updateText}`;
 }
 
-/** Builds a generic description of streamed tool-call input. */
 function toolInputActivity(
   event: AssistantMessageEvent | undefined,
   activeInputs: ReadonlyMap<string, string>,
@@ -275,12 +263,9 @@ function toolInputActivity(
   }
 }
 
-/**
- * Joins text blocks from mixed pi content.
- *
- * @param content Message or tool-result content blocks.
- * @returns Joined text, or `undefined` when there are no text blocks.
- */
+// Keep extraction literal here; sanitization is applied at model-output and UI
+// boundaries where the caller knows whether terminal safety or prompt context is
+// being prepared.
 export function extractTextContent(
   content: readonly TextSourceContent[],
 ): string | undefined {
@@ -290,7 +275,6 @@ export function extractTextContent(
     : undefined;
 }
 
-/** Converts a completed assistant message into a final-result fact. */
 function finalActivityText(message: AssistantMessage): string | undefined {
   switch (message.stopReason) {
     case "toolUse":
@@ -349,7 +333,6 @@ export class TldrFactCollector {
     return activity;
   }
 
-  /** Clears all conversation activity and restarts activity indexes. */
   resetConversation(): void {
     this.nextIndex = 1;
     this.activities.splice(0);
@@ -357,7 +340,6 @@ export class TldrFactCollector {
     this.activeToolExecutions.clear();
   }
 
-  /** Records a new user message as an immediate TLDR activity boundary. */
   recordUserMessage(prompt: string): TldrActivity {
     return this.addActivity(
       "user_message",
@@ -366,13 +348,9 @@ export class TldrFactCollector {
     );
   }
 
-  /**
-   * Records assistant streaming/update text as in-progress activity.
-   *
-   * @param message Pi message update event payload.
-   * @param event Optional streaming event with finer-grained update details.
-   * @returns The recorded TLDR activity, or undefined for non-assistant/empty messages.
-   */
+  // Pi emits streamed tool-call input through assistant message updates before
+  // the actual tool execution lifecycle begins. Treat those as tool-input facts
+  // first so long generated arguments can produce meaningful TLDR progress.
   recordAssistantUpdate(
     message: AgentMessage,
     event?: AssistantMessageEvent,
@@ -406,7 +384,6 @@ export class TldrFactCollector {
     );
   }
 
-  /** Records a tool call as generic tool activity. */
   recordToolCall(event: ToolCallEvent): TldrActivity {
     return this.addActivity(
       "tool_call",
@@ -415,7 +392,6 @@ export class TldrFactCollector {
     );
   }
 
-  /** Records the moment a tool starts executing. */
   recordToolExecutionStart(
     event: ToolExecutionStartActivityEvent,
   ): TldrActivity {
@@ -428,7 +404,6 @@ export class TldrFactCollector {
     return this.addActivity("tool_execution_start", "normal", anchorText);
   }
 
-  /** Records streaming progress from a running tool. */
   recordToolExecutionUpdate(
     event: ToolExecutionUpdateActivityEvent,
   ): TldrActivity {
@@ -447,7 +422,6 @@ export class TldrFactCollector {
     );
   }
 
-  /** Records the moment a tool finishes executing. */
   recordToolExecutionEnd(event: ToolExecutionEndActivityEvent): TldrActivity {
     const anchorText =
       this.activeToolExecutions.get(event.toolCallId) ??
@@ -467,7 +441,6 @@ export class TldrFactCollector {
     );
   }
 
-  /** Records a tool result as generic result activity. */
   recordToolResult(event: ToolResultEvent): TldrActivity {
     const resultText = extractTextContent(event.content);
     return this.addActivity(
@@ -479,12 +452,9 @@ export class TldrFactCollector {
     );
   }
 
-  /**
-   * Records or clears final assistant activity.
-   *
-   * @param message Final pi agent message.
-   * @returns The recorded activity, `emptyFinalStop`, or `ignored`.
-   */
+  // An empty successful final message usually means the visible work happened
+  // entirely through tools. Signal that separately so the UI can clear stale
+  // final text instead of summarizing an empty answer.
   recordMessageEnd(message: AgentMessage): MessageEndRecordResult {
     if (!isAssistantMessage(message)) return "ignored";
 
@@ -501,7 +471,6 @@ export class TldrFactCollector {
     );
   }
 
-  /** Returns recorded activities after `previousIndex` through `throughIndex`. */
   activitiesAfter(
     previousIndex: number,
     throughIndex: number,
@@ -512,17 +481,14 @@ export class TldrFactCollector {
     );
   }
 
-  /** Returns the latest activity index recorded in this conversation. */
   latestActivityIndex(): number {
     return this.nextIndex - 1;
   }
 
-  /** Returns the latest retained activity, if any. */
   latestActivity(): TldrActivity | undefined {
     return this.activities.at(-1);
   }
 
-  /** Discards raw activity already covered by an accepted TLDR checkpoint. */
   discardActivitiesThrough(activityIndex: number): void {
     const firstRetainedIndex = this.activities.findIndex(
       (activity) => activity.index > activityIndex,

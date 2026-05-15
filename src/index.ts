@@ -20,17 +20,10 @@ import {
 
 export type { PiTldrDependencies, TimerScheduler };
 
-/** Returns the production monotonic time for TLDR scheduling. */
 function defaultTldrClock(): number {
   return performance.now();
 }
 
-/**
- * Creates a pi-tldr extension instance.
- *
- * @param dependencies Optional test seams for model calls, clocks, and timers.
- * @returns A pi extension registration function.
- */
 export function createPiTldr(
   dependencies: PiTldrDependencies = {},
 ): (pi: ExtensionAPI) => void {
@@ -44,7 +37,6 @@ export function createPiTldr(
   );
   const scheduler = dependencies.scheduler ?? createDefaultTimerScheduler();
 
-  /** Registers this extension instance with pi. */
   return (pi: ExtensionAPI): void => {
     const state = createTldrState(
       generateTldr,
@@ -57,8 +49,7 @@ export function createPiTldr(
   };
 }
 
-/** Default pi-tldr extension instance used by pi's package loader. */
 export const piTldr = createPiTldr();
 
-/** pi's extension loader expects package extensions to provide a default export. */
+// pi loads package extensions through the package default export.
 export default piTldr;
