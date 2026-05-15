@@ -657,10 +657,16 @@ describe("piTldr extension entrypoint", () => {
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
-    assert.match(completions[0]?.systemPrompt ?? "", /doing right now/);
+    assert.match(completions[0]?.systemPrompt ?? "", /one plain-English TLDR/);
+    assert.match(completions[0]?.systemPrompt ?? "", /prior TLDRs for context/);
+    assert.match(completions[0]?.systemPrompt ?? "", /requested index/);
     assert.match(
       completions[0]?.systemPrompt ?? "",
-      /previous generated TLDR checkpoints/,
+      /summarize the available activity/,
+    );
+    assert.match(
+      completions[0]?.systemPrompt ?? "",
+      /Never ask for more information/,
     );
     assert.match(completions[0]?.systemPrompt ?? "", /present-tense/);
     assert.doesNotMatch(completions[0]?.systemPrompt ?? "", /past-tense/);
