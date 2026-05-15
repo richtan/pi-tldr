@@ -698,6 +698,8 @@ describe("piTldr extension entrypoint", () => {
     assert.doesNotMatch(completions[1]?.context ?? "", /\[1\] tool_call/);
     assert.match(completions[1]?.context ?? "", /\[2\] tool_result/);
     assert.match(completions[1]?.context ?? "", /Tests passed/);
+    assert.match(completions[1]?.systemPrompt ?? "", /past-tense/);
+    assert.doesNotMatch(completions[1]?.systemPrompt ?? "", /present-tense/);
   });
 
   it("keeps only the latest queued normal checkpoint target", async () => {

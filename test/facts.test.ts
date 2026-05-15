@@ -134,6 +134,8 @@ describe("TldrFactCollector", () => {
     assert.equal(assistantUpdate?.index, 2);
     assert.equal(toolCall.index, 3);
     assert.equal(toolResult.index, 4);
+    assert.equal(toolResult.activityType, "tool_result");
+    assert.equal(toolResult.displayPriority, "normal");
     if (typeof finalActivity !== "object") {
       assert.fail("expected final assistant activity");
     }

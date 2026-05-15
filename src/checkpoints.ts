@@ -28,7 +28,7 @@ const TLDR_REQUEST_TIMEOUT_MS = 2_000;
 export const DEFAULT_DISPLAY_UPDATE_INTERVAL_MS = 1_200;
 
 const IN_PROGRESS_TLDR_INSTRUCTION = "Start with a present-tense -ing verb.";
-const FINAL_TLDR_INSTRUCTION = "Start with a past-tense verb.";
+const COMPLETED_TLDR_INSTRUCTION = "Start with a past-tense verb.";
 
 /** Function shape used to call the model that writes TLDR text. */
 export type TldrModelCall = typeof complete;
@@ -45,6 +45,7 @@ export interface TimerScheduler {
 
 interface TldrCheckpointJob {
   readonly activityIndex: number;
+  readonly activityType: TldrActivity["activityType"];
   readonly displayPriority: TldrDisplayPriority;
   readonly runId: number;
 }
@@ -150,6 +151,7 @@ export class TldrCheckpointEngine {
 
     const job = {
       activityIndex: activity.index,
+      activityType: activity.activityType,
       displayPriority: activity.displayPriority,
       runId: this.work.runId,
     } satisfies TldrCheckpointJob;
@@ -443,12 +445,22 @@ ${tenseInstruction}`;
 
 /** Builds the system prompt sent to the TLDR model for a checkpoint. */
 function checkpointSystemPrompt(job: TldrCheckpointJob): string {
-  const tenseInstruction =
-    job.displayPriority === "final"
-      ? FINAL_TLDR_INSTRUCTION
-      : IN_PROGRESS_TLDR_INSTRUCTION;
+  const tenseInstruction = usesCompletedTense(job.activityType)
+    ? COMPLETED_TLDR_INSTRUCTION
+    : IN_PROGRESS_TLDR_INSTRUCTION;
 
   return tldrSystemPrompt(tenseInstruction);
+}
+
+/** Returns whether an activity describes completed work. */
+function usesCompletedTense(
+  activityType: TldrActivity["activityType"],
+): boolean {
+  return (
+    activityType === "tool_result" ||
+    activityType === "assistant_final" ||
+    activityType === "assistant_failure"
+  );
 }
 
 /** Formats accepted checkpoints as compressed prompt context. */
