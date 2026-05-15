@@ -35,19 +35,13 @@ immediately, and throttles ordinary activity updates to avoid flicker.
 
 ## Install
 
-Install globally for all pi projects:
+Install globally:
 
 ```bash
 pi install npm:pi-tldr
 ```
 
-Then restart pi, or run this inside an active pi session:
-
-```text
-/reload
-```
-
-Try it for one run without adding it to your settings:
+Try it for one session:
 
 ```bash
 pi -e npm:pi-tldr
@@ -69,13 +63,13 @@ pi remove npm:pi-tldr
 
 By default, `auto` tries these fast models in order:
 
-1. `anthropic/claude-haiku-4-5`
-2. `anthropic/claude-haiku-4-5-20251001`
-3. `openai-codex/gpt-5.4-mini`
-4. `openai-codex/gpt-5.3-codex-spark`
+1. `openai-codex/gpt-5.4-mini`
+2. `openai-codex/gpt-5.3-codex-spark`
+3. `anthropic/claude-haiku-4-5`
+4. `anthropic/claude-haiku-4-5-20251001`
 
-If none has a configured API key, the extension stays quiet instead of showing
-fake fallback text.
+If none has a configured API key, the extension shows `no tldr model authenticated`
+above the editor instead of showing fake fallback text.
 
 To prefer a specific TLDR model, set it in pi settings:
 
@@ -132,11 +126,12 @@ Example:
 ```text
 pi-tldr status
 selected model: auto
-active model: anthropic/claude-haiku-4-5
+active model: openai-codex/gpt-5.4-mini
 ```
 
-If no supported model is available, the active model is `none`. If auth cannot
-be checked, the active model is `unknown (auth check failed)`.
+If no supported model is available, the active model is `none` and pi-tldr shows
+`no tldr model authenticated` above the editor. If auth cannot be checked, the
+active model is `unknown (auth check failed)`.
 
 ## Privacy
 

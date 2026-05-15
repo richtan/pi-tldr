@@ -25,10 +25,10 @@ export interface FastModelAuth {
 // The TLDR path optimizes for low latency and low cost rather than reasoning
 // quality; these are deliberately fast fallback models already known to pi.
 const FAST_MODEL_CANDIDATES: readonly TldrModelPreference[] = [
-  { provider: "anthropic", id: "claude-haiku-4-5" },
-  { provider: "anthropic", id: "claude-haiku-4-5-20251001" },
   { provider: "openai-codex", id: "gpt-5.4-mini" },
   { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
+  { provider: "anthropic", id: "claude-haiku-4-5" },
+  { provider: "anthropic", id: "claude-haiku-4-5-20251001" },
 ];
 
 interface SettingsModelValue {

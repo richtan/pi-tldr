@@ -17,7 +17,7 @@ import {
 } from "./facts.js";
 import { getFastModelAuth, type TldrModelPreference } from "./models.js";
 import { sanitizeTldrText } from "./sanitize.js";
-import { showWidget } from "./tui.js";
+import { clearNoModelWarning, showNoModelWarning, showWidget } from "./tui.js";
 
 const PROMPT_TARGET_SUMMARY_CHARS = 80;
 const MAX_CONTEXT_CHECKPOINTS = 8;
@@ -325,7 +325,12 @@ export class TldrCheckpointEngine {
       if (!prompt) return;
 
       const auth = await getFastModelAuth(ctx, this.configuredModel);
-      if (!this.isCurrentCheckpointJob(job) || !auth) return;
+      if (!this.isCurrentCheckpointJob(job)) return;
+      if (!auth) {
+        showNoModelWarning(ctx);
+        return;
+      }
+      clearNoModelWarning(ctx);
 
       abortController = new AbortController();
       this.work.abortController = abortController;

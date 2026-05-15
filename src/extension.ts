@@ -22,7 +22,12 @@ import {
   getFastModelAuth,
   resolveInitialModelPreference,
 } from "./models.js";
-import { clearWidget, notifyUser } from "./tui.js";
+import {
+  clearNoModelWarning,
+  clearWidget,
+  notifyUser,
+  showNoModelWarning,
+} from "./tui.js";
 
 export interface PiTldrDependencies {
   readonly generateTldr?: TldrModelCall;
@@ -102,9 +107,13 @@ async function notifyTldrStatus(
 
   try {
     const auth = await getFastModelAuth(ctx, configuredModel);
-    activeModelLine = auth
-      ? `active model: ${formatAuthModelKey(auth)}`
-      : "active model: none";
+    if (auth) {
+      clearNoModelWarning(ctx);
+      activeModelLine = `active model: ${formatAuthModelKey(auth)}`;
+    } else {
+      showNoModelWarning(ctx);
+      activeModelLine = "active model: none";
+    }
   } catch {
     activeModelLine = "active model: unknown (auth check failed)";
   }
@@ -126,6 +135,7 @@ function registerTldrLifecycleHandlers(
     state.facts.resetConversation();
     state.checkpoints.startFreshRun();
     clearWidget(ctx);
+    clearNoModelWarning(ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
@@ -133,6 +143,7 @@ function registerTldrLifecycleHandlers(
     state.facts.resetConversation();
     state.checkpoints.startFreshRun();
     clearWidget(ctx);
+    clearNoModelWarning(ctx);
   });
 
   pi.on("before_agent_start", (event, ctx) => {

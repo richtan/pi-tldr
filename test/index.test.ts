@@ -68,11 +68,18 @@ type FakeAuthProvider = (
   model: Model<Api>,
 ) => Promise<FakeAuthResult> | FakeAuthResult;
 
+interface FakeWidgetCall {
+  readonly key: string;
+  readonly widget: unknown;
+  readonly options?: { readonly placement?: string };
+}
+
 interface FakeContextOptions {
   readonly model?: Model<Api>;
   readonly models?: readonly Model<Api>[];
   readonly auth?: FakeAuthResult | FakeAuthProvider;
   readonly widgets?: unknown[];
+  readonly widgetCalls?: FakeWidgetCall[];
   readonly cwd?: string;
   readonly notifications?: Array<{
     readonly message: string;
@@ -87,8 +94,13 @@ function createFakeContext(options: FakeContextOptions): ExtensionContext {
     hasUI: true,
     cwd: options.cwd ?? process.cwd(),
     ui: {
-      setWidget(_key: string, widget: unknown) {
-        options.widgets?.push(widget);
+      setWidget(
+        key: string,
+        widget: unknown,
+        widgetOptions?: { readonly placement?: string },
+      ) {
+        if (key === "pi-tldr") options.widgets?.push(widget);
+        options.widgetCalls?.push({ key, widget, options: widgetOptions });
       },
       notify(message: string, level: string) {
         options.notifications?.push({ message, level });
@@ -191,7 +203,7 @@ class FakeScheduler implements TimerScheduler {
 }
 
 async function flushAsyncWork(): Promise<void> {
-  for (let step = 0; step < 5; step++) {
+  for (let step = 0; step < 20; step++) {
     await Promise.resolve();
   }
 }
@@ -264,7 +276,16 @@ describe("piTldr extension entrypoint", () => {
       readonly message: string;
       readonly level: string;
     }> = [];
-    const { commands, ctx } = startExtension({}, { notifications });
+    const { commands, ctx } = startExtension(
+      {},
+      {
+        models: [
+          fakeModel("openai-codex", "gpt-5.4-mini"),
+          fakeModel("anthropic", "claude-haiku-4-5"),
+        ],
+        notifications,
+      },
+    );
 
     await commands.get("tldr")?.handler("status", ctx);
 
@@ -274,7 +295,7 @@ describe("piTldr extension entrypoint", () => {
         message: [
           "pi-tldr status",
           "selected model: auto",
-          "active model: anthropic/claude-haiku-4-5",
+          "active model: openai-codex/gpt-5.4-mini",
         ].join("\n"),
       },
     ]);
@@ -285,9 +306,10 @@ describe("piTldr extension entrypoint", () => {
       readonly message: string;
       readonly level: string;
     }> = [];
+    const widgetCalls: FakeWidgetCall[] = [];
     const { commands, ctx } = startExtension(
       {},
-      { auth: { ok: false }, notifications },
+      { auth: { ok: false }, notifications, widgetCalls },
     );
 
     await commands.get("tldr")?.handler("status", ctx);
@@ -298,6 +320,72 @@ describe("piTldr extension entrypoint", () => {
         "\n",
       ),
     );
+    const warningCall = widgetCalls.find(
+      (call) => call.options?.placement === "aboveEditor",
+    );
+    assert.ok(warningCall);
+    assert.equal(
+      renderWidgetText(warningCall.widget),
+      "no tldr model authenticated",
+    );
+  });
+
+  it("shows an above-editor warning when no TLDR model is authenticated", async () => {
+    const widgetCalls: FakeWidgetCall[] = [];
+    let generateCalls = 0;
+    const { events, ctx } = startExtension(
+      {
+        generateTldr: async () => {
+          generateCalls++;
+          return assistantResponse("Should not render.");
+        },
+      },
+      { auth: { ok: false }, widgetCalls },
+    );
+
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await flushAsyncWork();
+
+    const warningCall = widgetCalls.find(
+      (call) => call.options?.placement === "aboveEditor",
+    );
+    assert.ok(warningCall);
+    assert.equal(
+      renderWidgetText(warningCall.widget),
+      "no tldr model authenticated",
+    );
+    assert.equal(generateCalls, 0);
+  });
+
+  it("clears the no-model warning after TLDR auth succeeds", async () => {
+    const widgetCalls: FakeWidgetCall[] = [];
+    let authAvailable = false;
+    const { events, ctx } = startExtension(
+      {
+        generateTldr: async () => assistantResponse("Auth recovered."),
+      },
+      {
+        auth: () =>
+          authAvailable ? { ok: true, apiKey: "test-key" } : { ok: false },
+        widgetCalls,
+      },
+    );
+
+    events.get("before_agent_start")?.({ prompt: "First run" }, ctx);
+    await flushAsyncWork();
+
+    const warningCalls = () =>
+      widgetCalls.filter((call) => call.key === "pi-tldr-model-warning");
+    assert.equal(
+      renderWidgetText(warningCalls().at(-1)?.widget),
+      "no tldr model authenticated",
+    );
+
+    authAvailable = true;
+    events.get("before_agent_start")?.({ prompt: "Second run" }, ctx);
+    await flushAsyncWork();
+
+    assert.equal(warningCalls().at(-1)?.widget, undefined);
   });
 
   it("reports settings-selected models as selected and active", async () => {
@@ -484,7 +572,7 @@ describe("piTldr extension entrypoint", () => {
 
     assert.deepEqual(completionModels, [
       "openai-codex/gpt-5.4-mini:openai-codex-key",
-      "anthropic/claude-haiku-4-5:anthropic-key",
+      "openai-codex/gpt-5.4-mini:openai-codex-key",
     ]);
   });
 

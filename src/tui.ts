@@ -15,8 +15,26 @@ import {
 import { sanitizeTldrText } from "./sanitize.js";
 
 const WIDGET_KEY = "pi-tldr";
+const MODEL_WARNING_WIDGET_KEY = "pi-tldr-model-warning";
+const NO_TLDR_MODEL_AUTH_MESSAGE = "no tldr model authenticated";
 const TITLE = " tldr ";
 const MIN_BOX_WIDTH = 12;
+
+class WarningLine implements Component {
+  private readonly theme: Theme;
+  private readonly message: string;
+
+  constructor(theme: Theme, message: string) {
+    this.theme = theme;
+    this.message = message;
+  }
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    return [this.theme.fg("warning", truncateToWidth(this.message, width))];
+  }
+}
 
 // The widget is immutable: each rendered TLDR gets its own component instance,
 // which keeps width wrapping and theme application local to pi-tui's render pass.
@@ -80,6 +98,20 @@ class PiTldrBox implements Component {
 export function clearWidget(ctx: ExtensionContext): void {
   if (!ctx.hasUI) return;
   ctx.ui.setWidget(WIDGET_KEY, undefined);
+}
+
+export function clearNoModelWarning(ctx: ExtensionContext): void {
+  if (!ctx.hasUI) return;
+  ctx.ui.setWidget(MODEL_WARNING_WIDGET_KEY, undefined);
+}
+
+export function showNoModelWarning(ctx: ExtensionContext): void {
+  if (!ctx.hasUI) return;
+  ctx.ui.setWidget(
+    MODEL_WARNING_WIDGET_KEY,
+    (_tui, theme) => new WarningLine(theme, NO_TLDR_MODEL_AUTH_MESSAGE),
+    { placement: "aboveEditor" },
+  );
 }
 
 export function showWidget(ctx: ExtensionContext, tldr: string): void {
