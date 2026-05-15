@@ -9,14 +9,16 @@ import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createDefaultTimerScheduler,
-  createTldrState,
   DEFAULT_DISPLAY_UPDATE_INTERVAL_MS,
-  PiTldrDependencies,
+  type TimerScheduler,
+} from "./checkpoints.js";
+import {
+  createTldrState,
   registerTldrExtension,
-  TimerScheduler,
+  type PiTldrDependencies,
 } from "./extension.js";
 
-export { PiTldrDependencies, TimerScheduler };
+export type { PiTldrDependencies, TimerScheduler };
 
 /** Returns the production monotonic time for TLDR scheduling. */
 function defaultTldrClock(): number {

@@ -1142,7 +1142,7 @@ describe("piTldr extension entrypoint", () => {
 
     assert.equal(completeCalls.length, 1);
     assert.equal(completeCalls[0]?.options?.cacheRetention, "none");
-    assert.equal(completeCalls[0]?.options?.timeoutMs, 1_800);
+    assert.equal(completeCalls[0]?.options?.timeoutMs, 2_000);
     assert.equal(widgets.length, 3);
     assert.equal(widgets[0], undefined);
     assert.equal(widgets[1], undefined);
