@@ -8,8 +8,10 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
   AssistantMessage,
+  AssistantMessageEvent,
   ImageContent,
   TextContent,
+  ToolCall,
 } from "@earendil-works/pi-ai";
 import type {
   ToolCallEvent,
@@ -23,6 +25,26 @@ type TextSourceContent =
   | AssistantMessage["content"][number]
   | TextContent
   | ImageContent;
+
+interface ToolExecutionStartActivityEvent {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly args: unknown;
+}
+
+interface ToolExecutionUpdateActivityEvent {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly args: unknown;
+  readonly partialResult: unknown;
+}
+
+interface ToolExecutionEndActivityEvent {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly result: unknown;
+  readonly isError: boolean;
+}
 
 function truncateText(text: string, maxChars: number): string {
   if (maxChars <= 0) return "";
@@ -44,7 +66,13 @@ function truncateText(text: string, maxChars: number): string {
 export type TldrActivityType =
   | "user_message"
   | "assistant_update"
+  | "tool_input_start"
+  | "tool_input_update"
+  | "tool_input_end"
   | "tool_call"
+  | "tool_execution_start"
+  | "tool_execution_update"
+  | "tool_execution_end"
   | "tool_result"
   | "assistant_final"
   | "assistant_failure";
@@ -58,6 +86,7 @@ export interface TldrActivity {
   readonly activityType: TldrActivityType;
   readonly displayPriority: TldrDisplayPriority;
   readonly text: string;
+  readonly progressGroup?: string;
 }
 
 /** Result of recording an assistant message-end event into TLDR facts. */
@@ -81,6 +110,169 @@ function isTextContent(content: TextSourceContent): content is TextContent {
 /** Returns the string payload from a text content block. */
 function textBlockValue(content: TextContent): string {
   return content.text;
+}
+
+/** Narrows arbitrary event payload fields to records. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** Narrows unknown tool payload blocks to text content. */
+function isUnknownTextContent(value: unknown): value is TextContent {
+  return (
+    isRecord(value) && value.type === "text" && typeof value.text === "string"
+  );
+}
+
+/** Narrows assistant content blocks to completed or partial tool calls. */
+function isToolCallContent(value: unknown): value is ToolCall {
+  return (
+    isRecord(value) &&
+    value.type === "toolCall" &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    isRecord(value.arguments)
+  );
+}
+
+/** Returns the tool call currently represented by an assistant stream event. */
+function toolCallAtContentIndex(
+  message: AssistantMessage,
+  contentIndex: number,
+): ToolCall | undefined {
+  const content = message.content[contentIndex];
+  return isToolCallContent(content) ? content : undefined;
+}
+
+/** Extracts text blocks from unknown tool execution payload content. */
+function extractTextFromUnknownContent(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+
+  const textBlocks = content.filter(isUnknownTextContent);
+  return textBlocks.length > 0
+    ? textBlocks.map(textBlockValue).join("\n")
+    : undefined;
+}
+
+/** Converts arbitrary tool execution payloads into bounded activity text input. */
+function formatUnknownPayload(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value;
+
+  if (isRecord(value)) {
+    const contentText = extractTextFromUnknownContent(value.content);
+    if (contentText) return contentText;
+
+    if (typeof value.text === "string") return value.text;
+  }
+
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? String(value) : json;
+  } catch {
+    return String(value);
+  }
+}
+
+/** Appends an optional payload on a new line. */
+function appendPayload(prefix: string, payload: unknown): string {
+  const payloadText = formatUnknownPayload(payload);
+  return payloadText ? `${prefix}\n${payloadText}` : prefix;
+}
+
+interface ToolInputActivityResult {
+  readonly activityType:
+    | "tool_input_start"
+    | "tool_input_update"
+    | "tool_input_end";
+  readonly text: string;
+  readonly anchorKey?: string;
+  readonly anchorText?: string;
+  readonly clearAnchor?: boolean;
+  readonly progressGroup?: string;
+}
+
+/** Builds a stable key for a streamed tool-call input block. */
+function toolInputAnchorKey(
+  contentIndex: number,
+  toolCall: ToolCall | undefined,
+): string {
+  return toolCall?.id ?? `content:${contentIndex}`;
+}
+
+/** Formats an update as context for the original action. */
+function anchoredUpdateText(anchorText: string, updateText: string): string {
+  return `Main action: ${anchorText}\nUpdate context: ${updateText}`;
+}
+
+/** Builds a generic description of streamed tool-call input. */
+function toolInputActivity(
+  event: AssistantMessageEvent | undefined,
+  activeInputs: ReadonlyMap<string, string>,
+): ToolInputActivityResult | undefined {
+  if (!event) return undefined;
+
+  switch (event.type) {
+    case "toolcall_start": {
+      const toolCall = toolCallAtContentIndex(
+        event.partial,
+        event.contentIndex,
+      );
+      const toolName = toolCall?.name ?? "unknown tool";
+      const anchorKey = toolInputAnchorKey(event.contentIndex, toolCall);
+      const anchorText = appendPayload(
+        `Tool input started: ${toolName}`,
+        toolCall?.arguments,
+      );
+      return {
+        activityType: "tool_input_start",
+        text: anchorText,
+        anchorKey,
+        anchorText,
+      };
+    }
+    case "toolcall_delta": {
+      const toolCall = toolCallAtContentIndex(
+        event.partial,
+        event.contentIndex,
+      );
+      const toolName = toolCall?.name ?? "unknown tool";
+      const anchorKey = toolInputAnchorKey(event.contentIndex, toolCall);
+      const anchorText =
+        activeInputs.get(anchorKey) ?? `Tool input started: ${toolName}`;
+      const currentInput = formatUnknownPayload(toolCall?.arguments);
+      const latestChunk = event.delta
+        ? `Latest input chunk: ${event.delta}`
+        : undefined;
+      const updateText = [currentInput, latestChunk].filter(Boolean).join("\n");
+      return {
+        activityType: "tool_input_update",
+        text: anchoredUpdateText(
+          anchorText,
+          updateText || `Tool input streaming: ${toolName}`,
+        ),
+        anchorKey,
+        anchorText,
+        progressGroup: `tool-input:${anchorKey}`,
+      };
+    }
+    case "toolcall_end": {
+      const anchorText =
+        activeInputs.get(event.toolCall.id) ??
+        `Tool input started: ${event.toolCall.name}`;
+      return {
+        activityType: "tool_input_end",
+        text: anchoredUpdateText(
+          anchorText,
+          appendPayload("Tool input completed", event.toolCall.arguments),
+        ),
+        anchorKey: event.toolCall.id,
+        clearAnchor: true,
+      };
+    }
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -128,17 +320,21 @@ function finalActivityText(message: AssistantMessage): string | undefined {
 export class TldrFactCollector {
   private nextIndex = 1;
   private readonly activities: TldrActivity[] = [];
+  private readonly activeToolInputs = new Map<string, string>();
+  private readonly activeToolExecutions = new Map<string, string>();
 
   private addActivity(
     activityType: TldrActivityType,
     displayPriority: TldrDisplayPriority,
     text: string,
+    progressGroup?: string,
   ): TldrActivity {
     const activity = {
       index: this.nextIndex,
       activityType,
       displayPriority,
       text: truncateText(text, MAX_ACTIVITY_TEXT_CHARS),
+      ...(progressGroup ? { progressGroup } : {}),
     } satisfies TldrActivity;
 
     this.nextIndex++;
@@ -157,6 +353,8 @@ export class TldrFactCollector {
   resetConversation(): void {
     this.nextIndex = 1;
     this.activities.splice(0);
+    this.activeToolInputs.clear();
+    this.activeToolExecutions.clear();
   }
 
   /** Records a new user message as an immediate TLDR activity boundary. */
@@ -172,10 +370,31 @@ export class TldrFactCollector {
    * Records assistant streaming/update text as in-progress activity.
    *
    * @param message Pi message update event payload.
+   * @param event Optional streaming event with finer-grained update details.
    * @returns The recorded TLDR activity, or undefined for non-assistant/empty messages.
    */
-  recordAssistantUpdate(message: AgentMessage): TldrActivity | undefined {
+  recordAssistantUpdate(
+    message: AgentMessage,
+    event?: AssistantMessageEvent,
+  ): TldrActivity | undefined {
     if (!isAssistantMessage(message)) return undefined;
+
+    const toolInput = toolInputActivity(event, this.activeToolInputs);
+    if (toolInput) {
+      if (toolInput.anchorKey && toolInput.anchorText) {
+        this.activeToolInputs.set(toolInput.anchorKey, toolInput.anchorText);
+      }
+      if (toolInput.anchorKey && toolInput.clearAnchor) {
+        this.activeToolInputs.delete(toolInput.anchorKey);
+      }
+
+      return this.addActivity(
+        toolInput.activityType,
+        "normal",
+        toolInput.text,
+        toolInput.progressGroup,
+      );
+    }
 
     const assistantText = extractTextContent(message.content);
     if (!assistantText) return undefined;
@@ -192,7 +411,59 @@ export class TldrFactCollector {
     return this.addActivity(
       "tool_call",
       "normal",
-      `Tool started: ${event.toolName}`,
+      appendPayload(`Tool started: ${event.toolName}`, event.input),
+    );
+  }
+
+  /** Records the moment a tool starts executing. */
+  recordToolExecutionStart(
+    event: ToolExecutionStartActivityEvent,
+  ): TldrActivity {
+    const anchorText = appendPayload(
+      `Tool running: ${event.toolName}`,
+      event.args,
+    );
+    this.activeToolExecutions.set(event.toolCallId, anchorText);
+
+    return this.addActivity("tool_execution_start", "normal", anchorText);
+  }
+
+  /** Records streaming progress from a running tool. */
+  recordToolExecutionUpdate(
+    event: ToolExecutionUpdateActivityEvent,
+  ): TldrActivity {
+    const anchorText =
+      this.activeToolExecutions.get(event.toolCallId) ??
+      appendPayload(`Tool running: ${event.toolName}`, event.args);
+
+    return this.addActivity(
+      "tool_execution_update",
+      "normal",
+      anchoredUpdateText(
+        anchorText,
+        appendPayload("Tool execution update", event.partialResult),
+      ),
+      `tool-execution:${event.toolCallId}`,
+    );
+  }
+
+  /** Records the moment a tool finishes executing. */
+  recordToolExecutionEnd(event: ToolExecutionEndActivityEvent): TldrActivity {
+    const anchorText =
+      this.activeToolExecutions.get(event.toolCallId) ??
+      `Tool running: ${event.toolName}`;
+    this.activeToolExecutions.delete(event.toolCallId);
+
+    return this.addActivity(
+      "tool_execution_end",
+      "normal",
+      anchoredUpdateText(
+        anchorText,
+        appendPayload(
+          `Tool completed (${event.isError ? "error" : "ok"})`,
+          event.result,
+        ),
+      ),
     );
   }
 
@@ -244,6 +515,11 @@ export class TldrFactCollector {
   /** Returns the latest activity index recorded in this conversation. */
   latestActivityIndex(): number {
     return this.nextIndex - 1;
+  }
+
+  /** Returns the latest retained activity, if any. */
+  latestActivity(): TldrActivity | undefined {
+    return this.activities.at(-1);
   }
 
   /** Discards raw activity already covered by an accepted TLDR checkpoint. */

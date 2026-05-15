@@ -230,6 +230,9 @@ describe("piTldr extension entrypoint", () => {
       "before_agent_start",
       "message_update",
       "tool_call",
+      "tool_execution_start",
+      "tool_execution_update",
+      "tool_execution_end",
       "tool_result",
       "message_end",
     ]);
@@ -657,20 +660,6 @@ describe("piTldr extension entrypoint", () => {
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
-    assert.match(
-      completions[0]?.systemPrompt ?? "",
-      /one plain-English TLDR for a Pi coding agent/,
-    );
-    assert.match(completions[0]?.systemPrompt ?? "", /prior TLDRs for context/);
-    assert.match(completions[0]?.systemPrompt ?? "", /requested index/);
-    assert.match(
-      completions[0]?.systemPrompt ?? "",
-      /summarize the available activity/,
-    );
-    assert.match(
-      completions[0]?.systemPrompt ?? "",
-      /Never ask for more information/,
-    );
     assert.match(completions[0]?.systemPrompt ?? "", /present-tense/);
     assert.doesNotMatch(completions[0]?.systemPrompt ?? "", /past-tense/);
     assert.match(completions[0]?.context ?? "", /Previous generated TLDR/);
@@ -703,6 +692,409 @@ describe("piTldr extension entrypoint", () => {
     assert.match(completions[1]?.context ?? "", /Tests passed/);
     assert.match(completions[1]?.systemPrompt ?? "", /past-tense/);
     assert.doesNotMatch(completions[1]?.systemPrompt ?? "", /present-tense/);
+  });
+
+  it("generates checkpoints from streamed tool input before execution", async () => {
+    const completions: Array<{
+      readonly context: string;
+      readonly systemPrompt: string;
+    }> = [];
+    const partial = {
+      ...assistantResponse("", "toolUse"),
+      content: [
+        {
+          type: "toolCall",
+          id: "tool-1",
+          name: "custom_tool",
+          arguments: { query: "solana" },
+        },
+      ],
+    };
+    const { events, ctx } = startExtension({
+      now: () => 0,
+      generateTldr: async (_model, context) => {
+        completions.push({
+          context: JSON.stringify(context),
+          systemPrompt: context.systemPrompt ?? "",
+        });
+        return assistantResponse("Preparing tool input.");
+      },
+    });
+
+    events.get("message_update")?.(
+      {
+        message: partial,
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 0,
+          delta: ',"limit":10',
+          partial,
+        },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+    assert.match(completions[0]?.context ?? "", /\[1\] tool_input_update/);
+    assert.match(completions[0]?.context ?? "", /custom_tool/);
+    assert.match(completions[0]?.context ?? "", /Latest input chunk/);
+    assert.match(completions[0]?.systemPrompt ?? "", /present-tense/);
+    assert.doesNotMatch(completions[0]?.systemPrompt ?? "", /past-tense/);
+  });
+
+  it("renders in-progress normal checkpoints while newer updates are streaming", async () => {
+    const widgets: unknown[] = [];
+    const completions: Array<{
+      readonly resolve: (
+        response: ReturnType<typeof assistantResponse>,
+      ) => void;
+    }> = [];
+    const partial = {
+      ...assistantResponse("", "toolUse"),
+      content: [
+        {
+          type: "toolCall",
+          id: "tool-1",
+          name: "custom_tool",
+          arguments: { query: "solana" },
+        },
+      ],
+    };
+    const { events, ctx } = startExtension(
+      {
+        now: () => 0,
+        generateTldr: async () =>
+          new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
+            completions.push({ resolve });
+          }),
+      },
+      { widgets },
+    );
+
+    events.get("message_update")?.(
+      {
+        message: partial,
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 0,
+          delta: '"query":"sol',
+          partial,
+        },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+
+    events.get("message_update")?.(
+      {
+        message: partial,
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 0,
+          delta: 'ana"',
+          partial,
+        },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    completions[0]?.resolve(assistantResponse("Preparing tool input."));
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Preparing tool input\./);
+  });
+
+  it("drops stale progress checkpoints after the stream moves past updates", async () => {
+    const widgets: unknown[] = [];
+    const completions: Array<{
+      readonly resolve: (
+        response: ReturnType<typeof assistantResponse>,
+      ) => void;
+    }> = [];
+    const partial = {
+      ...assistantResponse("", "toolUse"),
+      content: [
+        {
+          type: "toolCall",
+          id: "tool-1",
+          name: "custom_tool",
+          arguments: { query: "solana" },
+        },
+      ],
+    };
+    const { events, ctx } = startExtension(
+      {
+        now: () => 0,
+        generateTldr: async () =>
+          new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
+            completions.push({ resolve });
+          }),
+      },
+      { widgets },
+    );
+
+    events.get("message_update")?.(
+      {
+        message: partial,
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 0,
+          delta: '"query":"solana"',
+          partial,
+        },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+
+    events.get("message_update")?.(
+      {
+        message: partial,
+        assistantMessageEvent: {
+          type: "toolcall_end",
+          contentIndex: 0,
+          toolCall: {
+            type: "toolCall",
+            id: "tool-1",
+            name: "custom_tool",
+            arguments: { query: "solana" },
+          },
+          partial,
+        },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    completions[0]?.resolve(assistantResponse("Stale tool progress."));
+    await flushAsyncWork();
+
+    assert.equal(
+      widgets.filter((widget) => typeof widget === "function").length,
+      0,
+    );
+  });
+
+  it("coalesces noisy tool progress TLDR display to ten-second intervals", async () => {
+    const scheduler = new FakeScheduler();
+    let now = 0;
+    const widgets: unknown[] = [];
+    const outputs = [
+      "Initial status.",
+      "First tool progress.",
+      "Second tool progress.",
+    ];
+    const partial = {
+      ...assistantResponse("", "toolUse"),
+      content: [
+        {
+          type: "toolCall",
+          id: "tool-1",
+          name: "custom_tool",
+          arguments: { query: "solana" },
+        },
+      ],
+    };
+    const { events, ctx } = startExtension(
+      {
+        scheduler,
+        now: () => now,
+        generateTldr: async () => assistantResponse(outputs.shift() ?? ""),
+      },
+      { widgets },
+    );
+
+    events.get("before_agent_start")?.({ prompt: "Research Solana" }, ctx);
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    events.get("message_update")?.(
+      {
+        message: partial,
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 0,
+          delta: '"query":"solana"',
+          partial,
+        },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    now = 9_999;
+    scheduler.advanceBy(9_999);
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    now = 10_000;
+    scheduler.advanceBy(1);
+
+    assert.match(renderWidgetText(widgets.at(-1)), /First tool progress\./);
+
+    events.get("message_update")?.(
+      {
+        message: partial,
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 0,
+          delta: ',"limit":10',
+          partial,
+        },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /First tool progress\./);
+
+    now = 19_999;
+    scheduler.advanceBy(9_999);
+
+    assert.match(renderWidgetText(widgets.at(-1)), /First tool progress\./);
+
+    now = 20_000;
+    scheduler.advanceBy(1);
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Second tool progress\./);
+  });
+
+  it("reschedules a long progress debounce for shorter ordinary updates", async () => {
+    const scheduler = new FakeScheduler();
+    let now = 0;
+    const widgets: unknown[] = [];
+    const outputs = ["Initial status.", "Tool progress.", "Assistant update."];
+    const partial = {
+      ...assistantResponse("", "toolUse"),
+      content: [
+        {
+          type: "toolCall",
+          id: "tool-1",
+          name: "custom_tool",
+          arguments: { query: "solana" },
+        },
+      ],
+    };
+    const { events, ctx } = startExtension(
+      {
+        scheduler,
+        now: () => now,
+        generateTldr: async () => assistantResponse(outputs.shift() ?? ""),
+      },
+      { widgets },
+    );
+
+    events.get("before_agent_start")?.({ prompt: "Research Solana" }, ctx);
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    events.get("message_update")?.(
+      {
+        message: partial,
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 0,
+          delta: '"query":"solana"',
+          partial,
+        },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    now = 500;
+    events.get("message_update")?.(
+      { message: assistantResponse("Reviewing progress") },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    scheduler.advanceBy(699);
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    now = 1_200;
+    scheduler.advanceBy(1);
+    assert.match(renderWidgetText(widgets.at(-1)), /Assistant update\./);
+  });
+
+  it("generates checkpoints from running tool updates before tool results", async () => {
+    const completions: Array<{
+      readonly context: string;
+      readonly systemPrompt: string;
+    }> = [];
+    const { events, ctx } = startExtension({
+      now: () => 0,
+      generateTldr: async (_model, context) => {
+        completions.push({
+          context: JSON.stringify(context),
+          systemPrompt: context.systemPrompt ?? "",
+        });
+        return assistantResponse("Running tests.");
+      },
+    });
+
+    events.get("tool_execution_update")?.(
+      {
+        toolName: "bash",
+        toolCallId: "tool-1",
+        args: { command: "npm test" },
+        partialResult: {
+          content: [{ type: "text", text: "Running test suite" }],
+        },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+    assert.match(completions[0]?.context ?? "", /\[1\] tool_execution_update/);
+    assert.match(completions[0]?.context ?? "", /Running test suite/);
+    assert.match(completions[0]?.systemPrompt ?? "", /present-tense/);
+    assert.doesNotMatch(completions[0]?.systemPrompt ?? "", /past-tense/);
+  });
+
+  it("uses past tense for completed tool execution checkpoints", async () => {
+    const completions: Array<{
+      readonly context: string;
+      readonly systemPrompt: string;
+    }> = [];
+    const { events, ctx } = startExtension({
+      now: () => 0,
+      generateTldr: async (_model, context) => {
+        completions.push({
+          context: JSON.stringify(context),
+          systemPrompt: context.systemPrompt ?? "",
+        });
+        return assistantResponse("Ran tests.");
+      },
+    });
+
+    events.get("tool_execution_end")?.(
+      {
+        toolName: "bash",
+        toolCallId: "tool-1",
+        isError: false,
+        result: { content: [{ type: "text", text: "Tests passed" }] },
+      },
+      ctx,
+    );
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 1);
+    assert.match(completions[0]?.context ?? "", /\[1\] tool_execution_end/);
+    assert.match(completions[0]?.context ?? "", /Tests passed/);
+    assert.match(completions[0]?.systemPrompt ?? "", /past-tense/);
+    assert.doesNotMatch(completions[0]?.systemPrompt ?? "", /present-tense/);
   });
 
   it("keeps only the latest queued normal checkpoint target", async () => {

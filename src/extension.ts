@@ -163,7 +163,10 @@ function registerTldrLifecycleHandlers(
   pi.on("message_update", (event, ctx) => {
     if (!state.sessionActive) return;
 
-    const activity = state.facts.recordAssistantUpdate(event.message);
+    const activity = state.facts.recordAssistantUpdate(
+      event.message,
+      event.assistantMessageEvent,
+    );
     if (activity) state.checkpoints.enqueue(ctx, activity);
   });
 
@@ -172,6 +175,30 @@ function registerTldrLifecycleHandlers(
     if (!state.sessionActive) return;
 
     state.checkpoints.enqueue(ctx, state.facts.recordToolCall(event));
+  });
+
+  // Records the beginning of actual tool execution.
+  pi.on("tool_execution_start", (event, ctx) => {
+    if (!state.sessionActive) return;
+
+    state.checkpoints.enqueue(ctx, state.facts.recordToolExecutionStart(event));
+  });
+
+  // Records streaming progress from a running tool.
+  pi.on("tool_execution_update", (event, ctx) => {
+    if (!state.sessionActive) return;
+
+    state.checkpoints.enqueue(
+      ctx,
+      state.facts.recordToolExecutionUpdate(event),
+    );
+  });
+
+  // Records completed tool execution.
+  pi.on("tool_execution_end", (event, ctx) => {
+    if (!state.sessionActive) return;
+
+    state.checkpoints.enqueue(ctx, state.facts.recordToolExecutionEnd(event));
   });
 
   // Records the result of tool activity.

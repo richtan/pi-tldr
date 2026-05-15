@@ -23,6 +23,7 @@ const PROMPT_TARGET_SUMMARY_CHARS = 80;
 const MAX_CONTEXT_CHECKPOINTS = 8;
 const TLDR_MAX_TOKENS = 120;
 const TLDR_REQUEST_TIMEOUT_MS = 2_000;
+const TOOL_PROGRESS_DISPLAY_UPDATE_INTERVAL_MS = 10_000;
 
 /** Default interval used to throttle ordinary widget display updates. */
 export const DEFAULT_DISPLAY_UPDATE_INTERVAL_MS = 1_200;
@@ -47,12 +48,15 @@ interface TldrCheckpointJob {
   readonly activityIndex: number;
   readonly activityType: TldrActivity["activityType"];
   readonly displayPriority: TldrDisplayPriority;
+  readonly progressGroup?: string;
   readonly runId: number;
 }
 
 interface TldrCheckpoint {
   readonly activityIndex: number;
+  readonly activityType: TldrActivity["activityType"];
   readonly displayPriority: TldrDisplayPriority;
+  readonly progressGroup?: string;
   readonly text: string;
 }
 
@@ -153,6 +157,7 @@ export class TldrCheckpointEngine {
       activityIndex: activity.index,
       activityType: activity.activityType,
       displayPriority: activity.displayPriority,
+      progressGroup: activity.progressGroup,
       runId: this.work.runId,
     } satisfies TldrCheckpointJob;
 
@@ -313,7 +318,9 @@ export class TldrCheckpointEngine {
 
       const checkpoint = {
         activityIndex: job.activityIndex,
+        activityType: job.activityType,
         displayPriority: job.displayPriority,
+        progressGroup: job.progressGroup,
         text,
       } satisfies TldrCheckpoint;
 
@@ -351,7 +358,7 @@ export class TldrCheckpointEngine {
     checkpoint: TldrCheckpoint,
   ): void {
     if (checkpoint.activityIndex <= this.work.lastRenderedActivityIndex) return;
-    if (checkpoint.activityIndex !== this.facts.latestActivityIndex()) return;
+    if (this.shouldDropStaleCheckpoint(checkpoint)) return;
 
     if (
       checkpoint.displayPriority !== "normal" ||
@@ -362,29 +369,72 @@ export class TldrCheckpointEngine {
       return;
     }
 
+    const displayIntervalMs = this.displayIntervalFor(checkpoint);
     const elapsedMs = this.now() - this.work.lastDisplayAt;
-    if (elapsedMs >= this.displayUpdateIntervalMs) {
+    if (elapsedMs >= displayIntervalMs) {
       this.clearPendingDisplay();
       this.renderCheckpoint(ctx, checkpoint);
       return;
     }
 
     this.work.pendingDisplayCheckpoint = checkpoint;
-    if (this.work.displayTimer !== undefined) return;
+    // Recompute the timer for each newly accepted pending checkpoint. This is
+    // important when a noisy progress update scheduled a long 10s debounce but
+    // a later ordinary update should render after the shorter normal interval.
+    this.clearDisplayTimer();
 
     this.work.displayTimer = this.scheduler.setTimeout(() => {
       this.work.displayTimer = undefined;
       const pendingCheckpoint = this.work.pendingDisplayCheckpoint;
       this.work.pendingDisplayCheckpoint = undefined;
       if (!pendingCheckpoint) return;
-      if (
-        pendingCheckpoint.activityIndex !== this.facts.latestActivityIndex()
-      ) {
-        return;
-      }
+      if (this.shouldDropStaleCheckpoint(pendingCheckpoint)) return;
 
       this.renderCheckpoint(ctx, pendingCheckpoint);
-    }, this.displayUpdateIntervalMs - elapsedMs);
+    }, displayIntervalMs - elapsedMs);
+  }
+
+  /** Returns whether an accepted checkpoint is too stale to render. */
+  private shouldDropStaleCheckpoint(checkpoint: TldrCheckpoint): boolean {
+    // Current checkpoints are always renderable; there is no newer activity that
+    // could make their TLDR misleading.
+    if (checkpoint.activityIndex === this.facts.latestActivityIndex()) {
+      return false;
+    }
+
+    // Boundary checkpoints must stay latest-only. A stale prompt-start/final
+    // TLDR would describe the wrong turn, so those are dropped once newer
+    // activity exists.
+    if (checkpoint.displayPriority !== "normal") return true;
+
+    // Most normal checkpoints are also latest-only. The only exception is
+    // noisy progress streams: a TLDR model call for chunk N may finish after
+    // chunk N+1 arrives, but it is still useful while the same stream is active.
+    if (!isToolProgressActivity(checkpoint.activityType)) return true;
+
+    // A progress group identifies one continuous stream. Without it, stale
+    // progress from unrelated streams could accidentally compare equal via
+    // `undefined === undefined`, so missing group metadata is treated as stale.
+    if (!checkpoint.progressGroup) return true;
+
+    const latestActivity = this.facts.latestActivity();
+
+    // Only render stale progress while the latest activity is a newer update
+    // from the same stream. If the stream completed, another tool took over, or
+    // ordinary assistant/tool activity arrived, the progress TLDR is obsolete.
+    return !(
+      latestActivity &&
+      latestActivity.index > checkpoint.activityIndex &&
+      latestActivity.activityType === checkpoint.activityType &&
+      latestActivity.progressGroup === checkpoint.progressGroup
+    );
+  }
+
+  /** Returns the display coalescing interval for a checkpoint. */
+  private displayIntervalFor(checkpoint: TldrCheckpoint): number {
+    return isToolProgressActivity(checkpoint.activityType)
+      ? TOOL_PROGRESS_DISPLAY_UPDATE_INTERVAL_MS
+      : this.displayUpdateIntervalMs;
   }
 
   /** Renders an accepted checkpoint. */
@@ -434,6 +484,9 @@ export class TldrCheckpointEngine {
 function tldrSystemPrompt(tenseInstruction: string): string {
   return `Write one plain-English TLDR for a Pi coding agent.
 Use the prior TLDRs for context and the new activity for the update.
+Describe the work progress as if a human developer were doing it.
+Focus on the task activity and current outcome, not agent mechanics.
+Do not mention tools, tool calls, prompts, messages, model output, or implementation details.
 Summarize only activity up to the requested index.
 If context is sparse, still summarize the available activity.
 Never ask for more information or say there is not enough context.
@@ -457,9 +510,21 @@ function usesCompletedTense(
   activityType: TldrActivity["activityType"],
 ): boolean {
   return (
+    activityType === "tool_input_end" ||
+    activityType === "tool_execution_end" ||
     activityType === "tool_result" ||
     activityType === "assistant_final" ||
     activityType === "assistant_failure"
+  );
+}
+
+/** Returns whether an activity can stream frequent progress updates. */
+function isToolProgressActivity(
+  activityType: TldrActivity["activityType"],
+): boolean {
+  return (
+    activityType === "tool_input_update" ||
+    activityType === "tool_execution_update"
   );
 }
 
