@@ -399,8 +399,10 @@ describe("piTldr extension entrypoint", () => {
     let authCalls = 0;
     let resolveFirstAuth: ((result: FakeAuthResult) => void) | undefined;
     const completionKeys: string[] = [];
+    const scheduler = new FakeScheduler();
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
+      scheduler,
       now: () => 0,
       generateTldr: async (_model, _context, options) => {
         completionKeys.push(options?.apiKey ?? "");
@@ -430,6 +432,7 @@ describe("piTldr extension entrypoint", () => {
       { message: assistantResponse("Writing a newer status") },
       ctx,
     );
+    scheduler.advanceBy(700);
 
     assert.equal(authCalls, 1);
 
@@ -581,6 +584,7 @@ describe("piTldr extension entrypoint", () => {
   });
 
   it("does not display stale checkpoints when newer activity exists", async () => {
+    const scheduler = new FakeScheduler();
     const widgets: unknown[] = [];
     const completions: Array<{
       readonly resolve: (
@@ -589,6 +593,7 @@ describe("piTldr extension entrypoint", () => {
     }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
+      scheduler,
       now: () => 0,
       generateTldr: async () =>
         new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
@@ -608,6 +613,7 @@ describe("piTldr extension entrypoint", () => {
       { message: assistantResponse("Still working") },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     completions[0]?.resolve(assistantResponse("Stale status."));
@@ -625,7 +631,8 @@ describe("piTldr extension entrypoint", () => {
     assert.match(renderWidgetText(widgets.at(-1)), /Current status\./);
   });
 
-  it("generates checkpoint targets for every activity sequentially", async () => {
+  it("generates checkpoint targets after normal activity quiets", async () => {
+    const scheduler = new FakeScheduler();
     const completions: Array<{
       readonly context: string;
       readonly systemPrompt: string;
@@ -635,6 +642,7 @@ describe("piTldr extension entrypoint", () => {
     }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
+      scheduler,
       now: () => 0,
       generateTldr: async (_model, context) =>
         new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
@@ -659,6 +667,16 @@ describe("piTldr extension entrypoint", () => {
     );
     await flushAsyncWork();
 
+    assert.equal(completions.length, 0);
+
+    scheduler.advanceBy(699);
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 0);
+
+    scheduler.advanceBy(1);
+    await flushAsyncWork();
+
     assert.equal(completions.length, 1);
     assert.match(completions[0]?.systemPrompt ?? "", /present-tense/);
     assert.doesNotMatch(completions[0]?.systemPrompt ?? "", /past-tense/);
@@ -675,6 +693,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
@@ -694,7 +713,87 @@ describe("piTldr extension entrypoint", () => {
     assert.doesNotMatch(completions[1]?.systemPrompt ?? "", /present-tense/);
   });
 
+  it("flushes continuous normal activity at the max burst wait", async () => {
+    const scheduler = new FakeScheduler();
+    let now = 0;
+    const advance = async (ms: number): Promise<void> => {
+      now += ms;
+      scheduler.advanceBy(ms);
+      await flushAsyncWork();
+    };
+    const completions: Array<{ readonly context: string }> = [];
+    const { events, ctx } = startExtension({
+      scheduler,
+      now: () => now,
+      generateTldr: async (_model, context) => {
+        completions.push({ context: JSON.stringify(context) });
+        return assistantResponse("Latest burst status.");
+      },
+    });
+
+    events.get("tool_call")?.(
+      { toolName: "read", toolCallId: "tool-1", input: { path: "a.ts" } },
+      ctx,
+    );
+    await advance(600);
+
+    events.get("message_update")?.(
+      { message: assistantResponse("Inspecting related files") },
+      ctx,
+    );
+    await advance(600);
+
+    events.get("tool_result")?.(
+      {
+        toolName: "read",
+        toolCallId: "tool-1",
+        isError: false,
+        content: [{ type: "text", text: "file contents" }],
+      },
+      ctx,
+    );
+    await advance(600);
+
+    events.get("message_update")?.(
+      { message: assistantResponse("Continuing the inspection") },
+      ctx,
+    );
+    await advance(699);
+
+    assert.equal(completions.length, 0);
+
+    await advance(1);
+
+    assert.equal(completions.length, 1);
+    assert.match(completions[0]?.context ?? "", /\[4\] assistant_update/);
+    assert.match(completions[0]?.context ?? "", /Continuing the inspection/);
+  });
+
+  it("cancels pending normal generation when a session shuts down", async () => {
+    const scheduler = new FakeScheduler();
+    const completions: Array<{ readonly context: string }> = [];
+    const { events, ctx } = startExtension({
+      scheduler,
+      now: () => 0,
+      generateTldr: async (_model, context) => {
+        completions.push({ context: JSON.stringify(context) });
+        return assistantResponse("Stale status.");
+      },
+    });
+
+    events.get("tool_call")?.(
+      { toolName: "read", toolCallId: "tool-1", input: { path: "a.ts" } },
+      ctx,
+    );
+    events.get("session_shutdown")?.({}, ctx);
+    scheduler.advanceBy(700);
+    await flushAsyncWork();
+
+    assert.equal(completions.length, 0);
+  });
+
   it("generates checkpoints from streamed tool input before execution", async () => {
+    const scheduler = new FakeScheduler();
     const completions: Array<{
       readonly context: string;
       readonly systemPrompt: string;
@@ -711,6 +810,7 @@ describe("piTldr extension entrypoint", () => {
       ],
     };
     const { events, ctx } = startExtension({
+      scheduler,
       now: () => 0,
       generateTldr: async (_model, context) => {
         completions.push({
@@ -733,6 +833,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
@@ -744,6 +845,7 @@ describe("piTldr extension entrypoint", () => {
   });
 
   it("renders in-progress normal checkpoints while newer updates are streaming", async () => {
+    const scheduler = new FakeScheduler();
     const widgets: unknown[] = [];
     const completions: Array<{
       readonly resolve: (
@@ -763,6 +865,7 @@ describe("piTldr extension entrypoint", () => {
     };
     const { events, ctx } = startExtension(
       {
+        scheduler,
         now: () => 0,
         generateTldr: async () =>
           new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
@@ -784,6 +887,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
@@ -809,6 +913,7 @@ describe("piTldr extension entrypoint", () => {
   });
 
   it("drops stale progress checkpoints after the stream moves past updates", async () => {
+    const scheduler = new FakeScheduler();
     const widgets: unknown[] = [];
     const completions: Array<{
       readonly resolve: (
@@ -828,6 +933,7 @@ describe("piTldr extension entrypoint", () => {
     };
     const { events, ctx } = startExtension(
       {
+        scheduler,
         now: () => 0,
         generateTldr: async () =>
           new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
@@ -849,6 +955,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
@@ -884,6 +991,11 @@ describe("piTldr extension entrypoint", () => {
   it("coalesces noisy tool progress TLDR display to ten-second intervals", async () => {
     const scheduler = new FakeScheduler();
     let now = 0;
+    const advance = async (ms: number): Promise<void> => {
+      now += ms;
+      scheduler.advanceBy(ms);
+      await flushAsyncWork();
+    };
     const widgets: unknown[] = [];
     const outputs = [
       "Initial status.",
@@ -929,16 +1041,16 @@ describe("piTldr extension entrypoint", () => {
     );
     await flushAsyncWork();
 
+    await advance(699);
     assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
 
-    now = 9_999;
-    scheduler.advanceBy(9_999);
-
+    await advance(1);
     assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
 
-    now = 10_000;
-    scheduler.advanceBy(1);
+    await advance(499);
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
 
+    await advance(1);
     assert.match(renderWidgetText(widgets.at(-1)), /First tool progress\./);
 
     events.get("message_update")?.(
@@ -955,24 +1067,31 @@ describe("piTldr extension entrypoint", () => {
     );
     await flushAsyncWork();
 
+    await advance(700);
     assert.match(renderWidgetText(widgets.at(-1)), /First tool progress\./);
 
-    now = 19_999;
-    scheduler.advanceBy(9_999);
-
+    await advance(9_299);
     assert.match(renderWidgetText(widgets.at(-1)), /First tool progress\./);
 
-    now = 20_000;
-    scheduler.advanceBy(1);
-
+    await advance(1);
     assert.match(renderWidgetText(widgets.at(-1)), /Second tool progress\./);
   });
 
   it("reschedules a long progress debounce for shorter ordinary updates", async () => {
     const scheduler = new FakeScheduler();
     let now = 0;
+    const advance = async (ms: number): Promise<void> => {
+      now += ms;
+      scheduler.advanceBy(ms);
+      await flushAsyncWork();
+    };
     const widgets: unknown[] = [];
-    const outputs = ["Initial status.", "Tool progress.", "Assistant update."];
+    const outputs = [
+      "Initial status.",
+      "First tool progress.",
+      "Second tool progress.",
+      "Assistant update.",
+    ];
     const partial = {
       ...assistantResponse("", "toolUse"),
       content: [
@@ -1010,29 +1129,49 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
-    await flushAsyncWork();
+    await advance(1_200);
 
-    now = 500;
+    assert.match(renderWidgetText(widgets.at(-1)), /First tool progress\./);
+
+    events.get("message_update")?.(
+      {
+        message: partial,
+        assistantMessageEvent: {
+          type: "toolcall_delta",
+          contentIndex: 0,
+          delta: ',"limit":10',
+          partial,
+        },
+      },
+      ctx,
+    );
+    await advance(700);
+
+    assert.match(renderWidgetText(widgets.at(-1)), /First tool progress\./);
+
     events.get("message_update")?.(
       { message: assistantResponse("Reviewing progress") },
       ctx,
     );
-    await flushAsyncWork();
+    await advance(699);
 
-    scheduler.advanceBy(699);
-    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+    assert.match(renderWidgetText(widgets.at(-1)), /First tool progress\./);
 
-    now = 1_200;
-    scheduler.advanceBy(1);
+    await advance(1);
+    assert.match(renderWidgetText(widgets.at(-1)), /Assistant update\./);
+
+    await advance(8_600);
     assert.match(renderWidgetText(widgets.at(-1)), /Assistant update\./);
   });
 
   it("generates checkpoints from running tool updates before tool results", async () => {
+    const scheduler = new FakeScheduler();
     const completions: Array<{
       readonly context: string;
       readonly systemPrompt: string;
     }> = [];
     const { events, ctx } = startExtension({
+      scheduler,
       now: () => 0,
       generateTldr: async (_model, context) => {
         completions.push({
@@ -1054,6 +1193,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
@@ -1064,11 +1204,13 @@ describe("piTldr extension entrypoint", () => {
   });
 
   it("uses past tense for completed tool execution checkpoints", async () => {
+    const scheduler = new FakeScheduler();
     const completions: Array<{
       readonly context: string;
       readonly systemPrompt: string;
     }> = [];
     const { events, ctx } = startExtension({
+      scheduler,
       now: () => 0,
       generateTldr: async (_model, context) => {
         completions.push({
@@ -1088,6 +1230,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
@@ -1098,6 +1241,7 @@ describe("piTldr extension entrypoint", () => {
   });
 
   it("keeps only the latest queued normal checkpoint target", async () => {
+    const scheduler = new FakeScheduler();
     const completions: Array<{
       readonly context: string;
       readonly resolve: (
@@ -1106,6 +1250,7 @@ describe("piTldr extension entrypoint", () => {
     }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
+      scheduler,
       now: () => 0,
       generateTldr: async (_model, context) =>
         new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
@@ -1138,6 +1283,7 @@ describe("piTldr extension entrypoint", () => {
       { message: assistantResponse("Still working") },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     completions[0]?.resolve(assistantResponse("Initial status."));
@@ -1159,6 +1305,7 @@ describe("piTldr extension entrypoint", () => {
   });
 
   it("final checkpoints supersede in-flight normal checkpoint generation", async () => {
+    const scheduler = new FakeScheduler();
     const widgets: unknown[] = [];
     const completions: Array<{
       readonly context: string;
@@ -1170,6 +1317,7 @@ describe("piTldr extension entrypoint", () => {
     }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
+      scheduler,
       now: () => 0,
       generateTldr: async (_model, context, options) =>
         new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
@@ -1193,6 +1341,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
@@ -1227,6 +1376,7 @@ describe("piTldr extension entrypoint", () => {
   });
 
   it("user-message checkpoints supersede in-flight final checkpoint generation", async () => {
+    const scheduler = new FakeScheduler();
     const widgets: unknown[] = [];
     const completions: Array<{
       readonly context: string;
@@ -1237,6 +1387,7 @@ describe("piTldr extension entrypoint", () => {
     }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
+      scheduler,
       now: () => 0,
       generateTldr: async (_model, context, options) =>
         new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
@@ -1288,6 +1439,7 @@ describe("piTldr extension entrypoint", () => {
       { message: assistantResponse("Continuing the follow-up") },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 4);
@@ -1299,6 +1451,7 @@ describe("piTldr extension entrypoint", () => {
   });
 
   it("does not abort in-flight normal checkpoints when newer normal activity queues", async () => {
+    const scheduler = new FakeScheduler();
     const completions: Array<{
       readonly context: string;
       readonly options?: ProviderStreamOptions;
@@ -1308,6 +1461,7 @@ describe("piTldr extension entrypoint", () => {
     }> = [];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
+      scheduler,
       now: () => 0,
       generateTldr: async (_model, context, options) =>
         new Promise<ReturnType<typeof assistantResponse>>((resolve) => {
@@ -1330,6 +1484,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
@@ -1345,6 +1500,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(completions.length, 1);
@@ -1361,11 +1517,7 @@ describe("piTldr extension entrypoint", () => {
     const scheduler = new FakeScheduler();
     let now = 0;
     const widgets: unknown[] = [];
-    const outputs = [
-      "Initial status.",
-      "Tool call status.",
-      "Tool result status.",
-    ];
+    const outputs = ["Initial status.", "Tool result status."];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
       scheduler,
@@ -1400,7 +1552,18 @@ describe("piTldr extension entrypoint", () => {
 
     assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
 
-    scheduler.advanceBy(1_199);
+    now = 699;
+    scheduler.advanceBy(699);
+    await flushAsyncWork();
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    now = 700;
+    scheduler.advanceBy(1);
+    await flushAsyncWork();
+    assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
+
+    now = 1_199;
+    scheduler.advanceBy(499);
     assert.match(renderWidgetText(widgets.at(-1)), /Initial status\./);
 
     now = 1_200;
@@ -1413,7 +1576,7 @@ describe("piTldr extension entrypoint", () => {
     const scheduler = new FakeScheduler();
     let now = 0;
     const widgets: unknown[] = [];
-    const outputs = ["Initial status.", "Tool call status.", "Final status."];
+    const outputs = ["Initial status.", "Final status."];
     const { pi, events } = createFakePiHarness();
     const extension = createPiTldr({
       scheduler,
@@ -1620,7 +1783,7 @@ describe("piTldr extension entrypoint", () => {
       },
       ctx,
     );
-    scheduler.advanceBy(0);
+    scheduler.advanceBy(700);
     await flushAsyncWork();
 
     assert.equal(abortSignal?.aborted, false);

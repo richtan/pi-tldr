@@ -24,6 +24,8 @@ const MAX_CONTEXT_CHECKPOINTS = 8;
 const TLDR_MAX_TOKENS = 120;
 const TLDR_REQUEST_TIMEOUT_MS = 2_000;
 const TOOL_PROGRESS_DISPLAY_UPDATE_INTERVAL_MS = 10_000;
+const NORMAL_CHECKPOINT_QUIET_MS = 700;
+const NORMAL_CHECKPOINT_MAX_WAIT_MS = 2_500;
 
 /** Default interval used to throttle ordinary widget display updates. */
 export const DEFAULT_DISPLAY_UPDATE_INTERVAL_MS = 1_200;
@@ -71,6 +73,10 @@ interface TldrWorkState {
   inFlightCheckpoint?: TldrCheckpointJob;
   pendingDisplayCheckpoint?: TldrCheckpoint;
   displayTimer?: unknown;
+  pendingNormalCheckpoint?: TldrCheckpointJob;
+  normalCheckpointTimer?: unknown;
+  normalCheckpointBurstStartedAt?: number;
+  lastRenderedProgressGroup?: string;
   abortController?: AbortController;
 }
 
@@ -163,17 +169,20 @@ export class TldrCheckpointEngine {
 
     if (job.displayPriority === "immediate") {
       this.clearPendingDisplay();
+      this.clearPendingNormalCheckpoint();
       this.forgetRenderedText();
       this.work.checkpointQueue.splice(0);
       this.abortInFlightCheckpoint();
       this.work.checkpointQueue.push(job);
     } else if (job.displayPriority === "final") {
       this.clearPendingDisplay();
+      this.clearPendingNormalCheckpoint();
       this.removeQueuedNormalCheckpoints();
       this.abortInFlightNormalCheckpoint();
       this.work.checkpointQueue.push(job);
     } else {
-      this.replaceQueuedNormalCheckpoint(job);
+      this.scheduleNormalCheckpoint(ctx, job);
+      return;
     }
 
     this.pumpCheckpointGeneration(ctx);
@@ -186,6 +195,7 @@ export class TldrCheckpointEngine {
     this.work.lastRenderedActivityIndex = 0;
     this.work.lastRenderedTldr = "";
     this.work.lastDisplayAt = Number.NEGATIVE_INFINITY;
+    this.work.lastRenderedProgressGroup = undefined;
     this.work.acceptedCheckpoints.splice(0);
     this.work.pendingDisplayCheckpoint = undefined;
   }
@@ -193,6 +203,7 @@ export class TldrCheckpointEngine {
   /** Cancels queued and in-flight checkpoint work. */
   private cancelCheckpointWork(): void {
     this.clearDisplayTimer();
+    this.clearPendingNormalCheckpoint();
     this.work.checkpointQueue.splice(0);
     this.work.inFlightCheckpoint = undefined;
     this.work.abortController?.abort();
@@ -216,6 +227,60 @@ export class TldrCheckpointEngine {
 
     this.scheduler.clearTimeout(this.work.displayTimer);
     this.work.displayTimer = undefined;
+  }
+
+  /** Cancels the pending normal-generation timer, if one exists. */
+  private clearNormalCheckpointTimer(): void {
+    if (this.work.normalCheckpointTimer === undefined) return;
+
+    this.scheduler.clearTimeout(this.work.normalCheckpointTimer);
+    this.work.normalCheckpointTimer = undefined;
+  }
+
+  /** Clears buffered normal activity that has not yet become a model request. */
+  private clearPendingNormalCheckpoint(): void {
+    this.clearNormalCheckpointTimer();
+    this.work.pendingNormalCheckpoint = undefined;
+    this.work.normalCheckpointBurstStartedAt = undefined;
+  }
+
+  /** Buffers rapid normal activity until it quiets down or reaches max wait. */
+  private scheduleNormalCheckpoint(
+    ctx: ExtensionContext,
+    job: TldrCheckpointJob,
+  ): void {
+    this.work.pendingNormalCheckpoint = job;
+    this.work.normalCheckpointBurstStartedAt ??= this.now();
+    this.clearNormalCheckpointTimer();
+
+    const burstStartedAt = this.work.normalCheckpointBurstStartedAt;
+    const elapsedSinceBurstStarted = this.now() - burstStartedAt;
+    const maxWaitRemainingMs =
+      NORMAL_CHECKPOINT_MAX_WAIT_MS - elapsedSinceBurstStarted;
+    const delayMs = Math.max(
+      0,
+      Math.min(NORMAL_CHECKPOINT_QUIET_MS, maxWaitRemainingMs),
+    );
+
+    if (delayMs === 0) {
+      this.flushPendingNormalCheckpoint(ctx);
+      return;
+    }
+
+    this.work.normalCheckpointTimer = this.scheduler.setTimeout(() => {
+      this.work.normalCheckpointTimer = undefined;
+      this.flushPendingNormalCheckpoint(ctx);
+    }, delayMs);
+  }
+
+  /** Turns the latest debounced normal activity into a checkpoint job. */
+  private flushPendingNormalCheckpoint(ctx: ExtensionContext): void {
+    const job = this.work.pendingNormalCheckpoint;
+    this.clearPendingNormalCheckpoint();
+    if (!job || job.runId !== this.work.runId) return;
+
+    this.replaceQueuedNormalCheckpoint(job);
+    this.pumpCheckpointGeneration(ctx);
   }
 
   /** Removes queued normal checkpoints that have been superseded. */
@@ -432,7 +497,12 @@ export class TldrCheckpointEngine {
 
   /** Returns the display coalescing interval for a checkpoint. */
   private displayIntervalFor(checkpoint: TldrCheckpoint): number {
-    return isToolProgressActivity(checkpoint.activityType)
+    if (!isToolProgressActivity(checkpoint.activityType)) {
+      return this.displayUpdateIntervalMs;
+    }
+
+    return checkpoint.progressGroup &&
+      checkpoint.progressGroup === this.work.lastRenderedProgressGroup
       ? TOOL_PROGRESS_DISPLAY_UPDATE_INTERVAL_MS
       : this.displayUpdateIntervalMs;
   }
@@ -448,6 +518,11 @@ export class TldrCheckpointEngine {
     this.work.lastRenderedActivityIndex = checkpoint.activityIndex;
     this.work.lastRenderedTldr = checkpoint.text;
     this.work.lastDisplayAt = this.now();
+    this.work.lastRenderedProgressGroup = isToolProgressActivity(
+      checkpoint.activityType,
+    )
+      ? checkpoint.progressGroup
+      : undefined;
     showWidget(ctx, checkpoint.text);
   }
 
