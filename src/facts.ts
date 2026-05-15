@@ -25,8 +25,19 @@ type TextSourceContent =
   | ImageContent;
 
 function truncateText(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars - 1)}…`;
+  if (maxChars <= 0) return "";
+
+  const chars = Array.from(text);
+  if (chars.length <= maxChars) return text;
+  if (maxChars === 1) return "…";
+
+  const retainedChars = maxChars - 1;
+  const headLength = Math.ceil(retainedChars / 2);
+  const tailLength = Math.floor(retainedChars / 2);
+
+  const head = chars.slice(0, headLength).join("");
+  const tail = tailLength > 0 ? chars.slice(-tailLength).join("") : "";
+  return `${head}…${tail}`;
 }
 
 /** The source event represented by a TLDR activity record. */

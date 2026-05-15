@@ -160,7 +160,21 @@ describe("TldrFactCollector", () => {
     });
   });
 
-  it("bounds activity text", () => {
+  it("middle-truncates long user messages without splitting surrogate pairs", () => {
+    const facts = new TldrFactCollector();
+    const prompt = `${"a".repeat(735)}🧪${"b".repeat(900)}TAIL✅`;
+
+    const activity = facts.recordUserMessage(prompt);
+
+    assert.equal(Array.from(activity.text).length, 1_500);
+    assert.equal(
+      activity.text.startsWith(`User message: ${"a".repeat(735)}🧪…`),
+      true,
+    );
+    assert.equal(activity.text.endsWith("TAIL✅"), true);
+  });
+
+  it("middle-truncates long tool result text", () => {
     const facts = new TldrFactCollector();
 
     const activity = facts.recordToolResult(
@@ -168,12 +182,18 @@ describe("TldrFactCollector", () => {
         toolName: "bash",
         toolCallId: "tool-1",
         isError: false,
-        content: [{ type: "text", text: "r".repeat(1_700) }],
+        content: [{ type: "text", text: `start-${"m".repeat(1_700)}-tail` }],
       }),
     );
 
-    assert.match(activity.text, /^Tool finished: bash \(ok\)\nr+…$/);
-    assert.equal(activity.text.includes("r".repeat(1_700)), false);
+    assert.equal(Array.from(activity.text).length, 1_500);
+    assert.equal(
+      activity.text.startsWith("Tool finished: bash (ok)\nstart-"),
+      true,
+    );
+    assert.equal(activity.text.includes("…"), true);
+    assert.equal(activity.text.endsWith("-tail"), true);
+    assert.equal(activity.text.includes("m".repeat(1_700)), false);
   });
 
   it("returns activity deltas after a checkpoint index", () => {
