@@ -40,7 +40,7 @@ function withHome<T>(home: string, run: () => T): T {
 }
 
 describe("tldr model settings", () => {
-  it("resolves project settings before user settings", () => {
+  it("resolves project settings before global settings", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "pi-tldr-settings-"));
     try {
       const home = join(tempDir, "home");
@@ -61,7 +61,7 @@ describe("tldr model settings", () => {
     }
   });
 
-  it("uses user settings when project settings do not configure tldr", () => {
+  it("uses global settings when project settings do not configure tldr", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "pi-tldr-settings-"));
     try {
       const home = join(tempDir, "home");

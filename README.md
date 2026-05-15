@@ -73,7 +73,7 @@ above the editor instead of showing fake fallback text.
 
 To prefer a specific TLDR model, set it in pi settings:
 
-User-wide:
+Global:
 
 ```json
 {
@@ -89,7 +89,7 @@ Save this in:
 ~/.pi/agent/settings.json
 ```
 
-Project-specific settings override user settings. Save project settings in:
+Project settings override global settings. Save project settings in:
 
 ```text
 .pi/settings.json

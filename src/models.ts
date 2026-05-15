@@ -92,7 +92,7 @@ function settingsModelValue(
 }
 
 // SettingsManager owns global/project lookup. Passing pi's session cwd lets
-// project-local `.pi/settings.json` override user-wide TLDR settings.
+// project-local `.pi/settings.json` override global TLDR settings.
 export function resolveInitialModelPreference(
   cwd: string,
 ): TldrModelPreference | undefined {
