@@ -25,6 +25,63 @@ const TLDR_MAX_TOKENS = 120;
 const TLDR_REQUEST_TIMEOUT_MS = 2_000;
 const TOOL_PROGRESS_DISPLAY_UPDATE_INTERVAL_MS = 10_000;
 
+/**
+ * Detect user locale from OS environment variables.
+ * Returns a BCP 47-like tag (e.g. "zh-CN", "ja", "ko") or undefined.
+ */
+function detectLocale(): string | undefined {
+  const candidates = [
+    process.env.PI_LOCALE,
+    process.env.LC_ALL,
+    process.env.LANG,
+  ].filter(Boolean) as string[];
+
+  for (const raw of candidates) {
+    const s = raw.trim();
+    if (!s) continue;
+    // Strip encoding suffix: "zh_CN.UTF-8" -> "zh_CN" -> "zh-CN"
+    const base = s.split(".")[0]!.replace(/_/g, "-");
+    if (base) return base;
+  }
+  return undefined;
+}
+
+/**
+ * Map locale tag to an output-language instruction for the TLDR model.
+ * Returns empty string for English/unknown locales (keep default English behavior).
+ */
+function languageInstructionForLocale(locale: string | undefined): string {
+  if (!locale) return "";
+  const lang = locale.split("-")[0]?.toLowerCase() ?? "";
+  const region = locale.split("-")[1]?.toUpperCase() ?? "";
+  switch (lang) {
+    case "zh":
+      // Distinguish Simplified vs Traditional by region
+      if (region === "TW" || region === "HK") {
+        return "Output in Traditional Chinese (繁體中文). ";
+      }
+      return "Output in Simplified Chinese (简体中文). ";
+    case "ja":
+      return "Output in Japanese (日本語). ";
+    case "ko":
+      return "Output in Korean (한국어). ";
+    case "de":
+      return "Output in German (Deutsch). ";
+    case "fr":
+      return "Output in French (Français). ";
+    case "es":
+      return "Output in Spanish (Español). ";
+    case "pt":
+      return "Output in Portuguese (Português). ";
+    case "ru":
+      return "Output in Russian (Русский). ";
+    case "ar":
+      return "Output in Arabic (العربية). ";
+    default:
+      return "";
+  }
+}
+
 // Ordinary activity should feel responsive without turning rapid read/grep/edit
 // bursts into a model-request ticker. The quiet window catches short bursts;
 // the max wait ensures continuous activity still surfaces progress.
@@ -78,6 +135,8 @@ interface TldrWorkState {
   normalCheckpointBurstStartedAt?: number;
   lastRenderedProgressGroup?: string;
   abortController?: AbortController;
+  /** Detected user locale for i18n TLDR output */
+  readonly locale: string | undefined;
 }
 
 export interface TldrCheckpointEngineOptions {
@@ -121,6 +180,7 @@ export class TldrCheckpointEngine {
     lastDisplayAt: Number.NEGATIVE_INFINITY,
     checkpointQueue: [],
     acceptedCheckpoints: [],
+    locale: detectLocale(),
   };
 
   constructor(options: TldrCheckpointEngineOptions) {
@@ -338,7 +398,7 @@ export class TldrCheckpointEngine {
       const response = await this.generateTldr(
         auth.model,
         {
-          systemPrompt: checkpointSystemPrompt(job),
+          systemPrompt: checkpointSystemPrompt(job, this.work.locale),
           messages: [prompt],
         },
         {
@@ -526,9 +586,13 @@ export class TldrCheckpointEngine {
   }
 }
 
-function tldrSystemPrompt(tenseInstruction: string): string {
-  return `Write one plain-English TLDR for a Pi coding agent.
-Use the prior TLDRs for context and the new activity for the update.
+function tldrSystemPrompt(
+  tenseInstruction: string,
+  locale?: string,
+): string {
+  const langInstr = languageInstructionForLocale(locale);
+  return `Write one TLDR summary for a Pi coding agent.
+${langInstr}Use the prior TLDRs for context and the new activity for the update.
 Describe the work progress as if a human developer were doing it.
 Focus on the task activity and current outcome, not agent mechanics.
 Do not mention tools, tool calls, prompts, messages, model output, or implementation details.
@@ -541,12 +605,15 @@ Plain text only; no markdown, JSON, code, bullets, quotes, or file/tool names.
 ${tenseInstruction}`;
 }
 
-function checkpointSystemPrompt(job: TldrCheckpointJob): string {
+function checkpointSystemPrompt(
+  job: TldrCheckpointJob,
+  locale?: string,
+): string {
   const tenseInstruction = usesCompletedTense(job.activityType)
     ? COMPLETED_TLDR_INSTRUCTION
     : IN_PROGRESS_TLDR_INSTRUCTION;
 
-  return tldrSystemPrompt(tenseInstruction);
+  return tldrSystemPrompt(tenseInstruction, locale);
 }
 
 function usesCompletedTense(
