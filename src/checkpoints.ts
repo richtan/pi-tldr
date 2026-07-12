@@ -6,7 +6,7 @@
  * throttled widget rendering. Its interface is intentionally narrow so the pi
  * event adapter only reports activity boundaries and session/model changes.
  */
-import { complete } from "@earendil-works/pi-ai";
+import type { complete } from "@earendil-works/pi-ai/compat";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
