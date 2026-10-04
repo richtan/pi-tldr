@@ -11,6 +11,7 @@ import {
   createDefaultTimerScheduler,
   DEFAULT_DISPLAY_UPDATE_INTERVAL_MS,
   type TimerScheduler,
+  type TldrListener,
 } from "./checkpoints.js";
 import {
   createTldrState,
@@ -18,7 +19,7 @@ import {
   type PiTldrDependencies,
 } from "./extension.js";
 
-export type { PiTldrDependencies, TimerScheduler };
+export type { PiTldrDependencies, TimerScheduler, TldrListener };
 
 function defaultTldrClock(): number {
   return performance.now();
@@ -43,6 +44,7 @@ export function createPiTldr(
       now,
       displayUpdateIntervalMs,
       scheduler,
+      dependencies.onTldr,
     );
 
     registerTldrExtension(pi, state);

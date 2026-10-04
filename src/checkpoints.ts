@@ -38,6 +38,7 @@ const COMPLETED_TLDR_INSTRUCTION = "Start with a past-tense verb.";
 
 export type TldrModelCall = typeof complete;
 export type TldrClock = () => number;
+export type TldrListener = (tldr: string) => void;
 
 // Timer handles differ between Node and fake test schedulers, so the engine
 // treats them as opaque tokens and keeps scheduling policy injectable.
@@ -86,6 +87,7 @@ export interface TldrCheckpointEngineOptions {
   readonly now: TldrClock;
   readonly displayUpdateIntervalMs: number;
   readonly scheduler: TimerScheduler;
+  readonly onTldr?: TldrListener;
 }
 
 export function createDefaultTimerScheduler(): TimerScheduler {
@@ -112,6 +114,7 @@ export class TldrCheckpointEngine {
   private readonly now: TldrClock;
   private readonly displayUpdateIntervalMs: number;
   private readonly scheduler: TimerScheduler;
+  private readonly onTldr?: TldrListener;
   private configuredModel?: TldrModelPreference;
   private readonly work: TldrWorkState = {
     runId: 0,
@@ -129,6 +132,7 @@ export class TldrCheckpointEngine {
     this.now = options.now;
     this.displayUpdateIntervalMs = options.displayUpdateIntervalMs;
     this.scheduler = options.scheduler;
+    this.onTldr = options.onTldr;
   }
 
   selectedModel(): TldrModelPreference | undefined {
@@ -496,6 +500,18 @@ export class TldrCheckpointEngine {
       ? checkpoint.progressGroup
       : undefined;
     showWidget(ctx, checkpoint.text);
+    this.notifyTldrListener(checkpoint.text);
+  }
+
+  // Embedders mirror the rendered TLDR elsewhere (a status line, a chat
+  // surface). Their failures must never break the widget or later checkpoints.
+  private notifyTldrListener(text: string): void {
+    if (!this.onTldr) return;
+    try {
+      this.onTldr(text);
+    } catch {
+      // Best-effort, like TLDR generation itself.
+    }
   }
 
   private checkpointPrompt(job: TldrCheckpointJob): UserMessage | undefined {

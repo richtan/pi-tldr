@@ -719,6 +719,48 @@ describe("piTldr extension entrypoint", () => {
     assert.match(renderWidgetText(widgets.at(-1)), /Current status\./);
   });
 
+  it("reports each rendered TLDR to onTldr", async () => {
+    const widgets: unknown[] = [];
+    const reported: string[] = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      scheduler: new FakeScheduler(),
+      now: () => 0,
+      generateTldr: async () => assistantResponse("Checking status."),
+      onTldr: (tldr) => reported.push(tldr),
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await flushAsyncWork();
+
+    assert.deepEqual(reported, ["Checking status."]);
+    assert.match(renderWidgetText(widgets.at(-1)), /Checking status\./);
+  });
+
+  it("keeps rendering when onTldr throws", async () => {
+    const widgets: unknown[] = [];
+    const { pi, events } = createFakePiHarness();
+    const extension = createPiTldr({
+      scheduler: new FakeScheduler(),
+      now: () => 0,
+      generateTldr: async () => assistantResponse("Checking status."),
+      onTldr: () => {
+        throw new Error("embedder failed");
+      },
+    });
+    const ctx = createFakeContext({ widgets });
+
+    extension(pi);
+    events.get("session_start")?.({}, ctx);
+    events.get("before_agent_start")?.({ prompt: "Check status" }, ctx);
+    await flushAsyncWork();
+
+    assert.match(renderWidgetText(widgets.at(-1)), /Checking status\./);
+  });
+
   it("generates checkpoint targets after normal activity quiets", async () => {
     const scheduler = new FakeScheduler();
     const completions: Array<{

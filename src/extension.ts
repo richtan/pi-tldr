@@ -13,6 +13,7 @@ import {
   TldrCheckpointEngine,
   type TimerScheduler,
   type TldrClock,
+  type TldrListener,
   type TldrModelCall,
 } from "./checkpoints.js";
 import { TldrFactCollector } from "./facts.js";
@@ -37,6 +38,9 @@ export interface PiTldrDependencies {
   // tune the same UI cadence after the generation/display split.
   readonly toolActivityCoalesceMs?: number;
   readonly scheduler?: TimerScheduler;
+  // Called with each TLDR as the widget renders it, so an embedder can show
+  // the same text elsewhere without reading the TUI component.
+  readonly onTldr?: TldrListener;
 }
 
 export interface TldrState {
@@ -50,6 +54,7 @@ export function createTldrState(
   now: TldrClock,
   displayUpdateIntervalMs: number,
   scheduler: TimerScheduler,
+  onTldr?: TldrListener,
 ): TldrState {
   const facts = new TldrFactCollector();
 
@@ -62,6 +67,7 @@ export function createTldrState(
       now,
       displayUpdateIntervalMs,
       scheduler,
+      onTldr,
     }),
   };
 }
